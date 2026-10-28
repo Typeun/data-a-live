@@ -3,7 +3,7 @@ index 96af842..091e113 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
 @@ -112,6 +112,7 @@ bsd/dev/fuxi_touch.c			standard
- bsd/dev/pandora_touch.c			standard
+ bsd/dev/myron_touch.c			standard
  bsd/dev/pandora_amp.c			standard
  bsd/dev/pandora_csfw.c			standard
 +bsd/dev/pandora_gpi.c			standard

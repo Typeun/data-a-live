@@ -10,11 +10,30 @@
 #   (tools/addtrustcache.py), e.g. /opt/work/ipsw/Firmware/087-86698-044.dmg.trustcache
 set -e
 R=$1; EXTRA=${2:-}; N=${NAME:-out}; CPUS=${CPUS:-1}; RD=${RD:-md0}; DEBUG=${DEBUG:-0xc}
-RAMDISK=(); [ "$RD" = md0 ] && RAMDISK=(--ramdisk /opt/work/init/sweet-init)
-P=/mnt/d/DeepSeekHarness/claude/ios_pandora; T=/opt/work/tools; mkdir -p $T
-for f in adt.py mkadt.py mkpayload.py; do tr -d '\r' < $P/ref/ios-sweet/tools/$f > $T/$f; done
-tr -d '\r' < $P/tools/mkadt_pandora.py > $T/mkadt_pandora.py
-tr -d '\r' < $P/tools/addtrustcache.py > $T/addtrustcache.py
+RAMDISK=()
+if [ "$RD" = md0 ]; then
+	INIT=${INIT:-$SRC/init/sweet-init}
+	[ -f "$INIT" ] || {
+		echo "md0 root needs a ramdisk: build ios-sweet's tools/sweet-init.S and pass INIT=..." >&2
+		echo "  (or use --rd ufsroot0 to boot the pinned root image directly)" >&2
+		exit 1
+	}
+	RAMDISK=(--ramdisk "$INIT")
+fi
+# Source tree and scratch copy: set SRC/T, otherwise the repo this script lives in and a temp dir.
+SRC=${SRC:-$(cd "$(dirname "$0")/.." && pwd)}; T=${T:-/tmp/myron-tools}; mkdir -p $T
+# python3 when it works, else python (Git Bash ships the former as a store stub)
+PY=
+for c in python3 python; do
+	if command -v "$c" >/dev/null 2>&1 && "$c" -c 'import sys' >/dev/null 2>&1; then
+		PY=$c
+		break
+	fi
+done
+[ -n "$PY" ] || { echo "needs python3" >&2; exit 1; }
+for f in adt.py mkpayload.py; do tr -d '\r' < $SRC/tools/$f > $T/$f; done
+tr -d '\r' < $SRC/tools/mkadt_pandora.py > $T/mkadt_pandora.py
+tr -d '\r' < $SRC/tools/addtrustcache.py > $T/addtrustcache.py
 # Kernel VA that maps to phys_base: 32 MB below the lowest segment instead of the mach header,
 # so original kexts that tools/mkprelink.py placed below our kernel are copied too (same value
 # as before for a kernel without them).
@@ -22,22 +41,22 @@ sed -i "s/virt_base = text\['vmaddr'\] & ~(0x2000000 - 1)/virt_base = min(s['vma
 grep -q "virt_base = min(s\['vmaddr'\] for s in segs) & ~(0x2000000 - 1)" $T/mkpayload.py
 K=${KERNEL:-$R/xnu-kernel/kernel.development.pandora}
 O=$R/phone-$N; rm -rf $O; mkdir -p $O
-python3 $T/mkadt_pandora.py $O/phone.adt ${ADTFLAGS:-} 2>&1 | tail -2
-python3 $T/mkpayload.py $K $O/phone.adt $O/payload.bin \
+"$PY" $T/mkadt_pandora.py $O/phone.adt ${ADTFLAGS:-} 2>&1 | tail -2
+"$PY" $T/mkpayload.py $K $O/phone.adt $O/payload.bin \
   --cmdline "debug=$DEBUG serial=3 cpus=$CPUS keepsyms=1 -enable_kprintf_spam -noprogress rd=$RD $EXTRA" \
   "${RAMDISK[@]}" 2>&1 | tail -4
 if [ -n "${TRUSTCACHE:-}" ]; then
 	python3 $T/addtrustcache.py $O/payload.bin $O/payload-tc.bin $TRUSTCACHE
 	mv $O/payload-tc.bin $O/payload.bin
 fi
-mkdir -p $P/shim/loader/$N
-cp $O/payload.bin $P/shim/loader/$N/payload.bin
+mkdir -p $SRC/shim/loader/$N
+cp $O/payload.bin $SRC/shim/loader/$N/payload.bin
 # The boot logo shim/loader shows without -v: Apple's, from the user's IPSW (Firmware/all_flash/
 # applelogo@3x~iphone.im4p), never committed. LOGO=FILE for another; none: a black screen.
-LOGO=${LOGO:-/opt/work/ipsw/logo/applelogo@3x~iphone.im4p}
+LOGO=${LOGO:-}      # none: the loader shows a black screen instead of Apple's logo
 if [ -f "$LOGO" ]; then
-	python3 -I $P/tools/bootlogo.py "$LOGO" $P/shim/loader/$N/logo.bin
+	python3 -I $SRC/tools/bootlogo.py "$LOGO" $SRC/shim/loader/$N/logo.bin
 else
-	rm -f $P/shim/loader/$N/logo.bin
+	rm -f $SRC/shim/loader/$N/logo.bin
 fi
 sha256sum $K $O/payload.bin

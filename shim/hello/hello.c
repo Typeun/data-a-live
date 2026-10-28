@@ -141,7 +141,7 @@ static void find_framebuffer(void)
 	}
 	/* Default guess when no pipe scans out of the splash region. */
 	uint64_t base = SPLASH;
-	fb_w = 1220; fb_h = 2656; fb_stride = 1220 * 4;
+	fb_w = 1200; fb_h = 2608; fb_stride = 1200 * 4;
 	if (pick >= 0) {
 		uint32_t w = pipes[pick].size & 0xffff, h = pipes[pick].size >> 16;
 		uint32_t s = pipes[pick].stride & 0xffff;

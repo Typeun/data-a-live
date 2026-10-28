@@ -23,7 +23,7 @@ index 0000000..72d86f1
 + * frame at about 20 s): the side button when the display is off, a swipe up from the bottom edge (unlock; the test
 + * phone has no passcode), then the home screen paged left and right, a swipe about every 0.8 s, the swipe up again
 + * every 20 swipes in case the lock screen came back, for SECONDS. Finger 0 through sweet_hid_touch, in the presented
-+ * display's pixels (1125 x 2436) as bsd/dev/pandora_touch.c delivers them.
++ * display's pixels (1125 x 2436) as bsd/dev/myron_touch.c delivers them.
 + */
 +#if defined(PANDORA)
 +#include <sys/param.h>
@@ -45,7 +45,7 @@ index 0000000..72d86f1
 +#define AS_STEPS        12              /* moves of one swipe */
 +#define AS_STEP_MS      16              /* one 60 Hz touch report apart */
 +#define AS_PAUSE_MS     600             /* after a swipe: the page settles */
-+#define AS_PRIORITY     92              /* BASEPRI_PREEMPT, as pandora_touch's thread */
++#define AS_PRIORITY     92              /* BASEPRI_PREEMPT, as myron_touch's thread */
 +
 +static int as_chan;
 +static uint32_t as_secs, as_at = 45;

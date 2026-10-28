@@ -6,7 +6,7 @@ index 7053cb4..701d47f 100644
  bsd/dev/sweet_keys.c			standard
  bsd/dev/sweet_touch.c			standard
  bsd/dev/fuxi_touch.c			standard
-+bsd/dev/pandora_touch.c			standard
++bsd/dev/myron_touch.c			standard
  bsd/dev/fuxi_adreno.c			standard
  bsd/dev/fuxi_perf.c			standard
  bsd/dev/fuxi_keys.c			standard
@@ -63,17 +63,16 @@ index f26de18..3845903 100644
  	printf("PANDORA KEYS: pandora_keys=%u\n", pk_mask);
  	if (!(pk_mask & 1u)) {
  		goto gpio;
-diff --git a/bsd/dev/pandora_touch.c b/bsd/dev/pandora_touch.c
+diff --git a/bsd/dev/myron_touch.c b/bsd/dev/myron_touch.c
 new file mode 100644
-index 0000000..ba59015
 --- /dev/null
-+++ b/bsd/dev/pandora_touch.c
-@@ -0,0 +1,1292 @@
++++ b/bsd/dev/myron_touch.c
+@@ -0,0 +1,1267 @@
 +/*
-+ * PANDORA (Xiaomi 17 Pro, SM8850) main screen touch: Synaptics S3910P speaking
-+ * TouchComm (v1 or v2, detected) over SPI on QUPv3 wrapper 4 SE0 (0x01a80000), FIFO mode,
-+ * polled. Hardware from the live DT (device/DT_FINDINGS.md):
-+ *   IRQ    TLMM GPIO 158, active low        reset  GPIO 66, active low
++ * MYRON (Redmi K90 Pro Max, SM8850) main screen touch: FocalTech FT3683 over SPI
++ * on QUPv3 wrapper 4 SE0 (0x01a80000), polled through GPI DMA. The transport below is
++ * pandora's, unchanged: the board wiring is identical (SE, pins 48-51, reset 66, irq 158).
++ * Only the protocol layer differs: FTS framing from the vendor module focaltech_touch_3683.ko.
 + *   avdd   fixed regulator, GPIO 117 high   iovdd  RPMh LDO "L4I_E0" 1.8 V (pmh0110_i_l4)
 + *   SPI    GPIO 48 MISO, 49 MOSI, 50 CLK, 51 CS, function 1 (qup4_se0), 6 mA, pull-down
 + * TLMM pins are 0x1000 apart from 0x0f100000: the downstream pinctrl-canoe.ko adds
@@ -82,11 +81,17 @@ index 0000000..ba59015
 + * bits 22-26, SE0 RCG 0xa9014); GENI and SPI registers as Linux qcom-geni-se.c and
 + * spi-geni-qcom.c; TouchComm as Synaptics' syna_c10 driver (tcm/*.c).
 + *
-+ * Boot-arg pandora_touch (bit mask, default 0 = off):
++ * Boot-arg myron_touch (bit mask, default 0xf; 0 = off):
 + *   bit 0  probe: print GCC, SE and pin state (votes the wrapper 4 clocks on)
 + *   bit 1  vote L4I_E0 on (1.8 V, high power mode) through RPMh, apps RSC DRV 2
 + *   bit 2  run: SPI set-up, avdd, reset, TouchComm identify, application info, touch
 + *          report config, then report touches to SweetHIDTouch
++ *   bit 3  dump the first report frames (myron_touch_raw=1)
++ *          16 x 35 signed 16-bit capacitance deltas) and find fingers in them here, for
++ *          a firmware that leaves touch positions to the host. Its own touch reports
++ *          (0x11) win when they come. pandora_thp_thr (default 200) is the finger
++ *          threshold, pandora_thp_swap=1 reads the deltas as 35 rows of 16,
++ *          pandora_thp_flip bit 0 / bit 1 mirror x / y.
 + * pandora_steps=MS: before the first access to each new register region print its
 + * name and wait MS (default 0), so a bus hang leaves the name in the log file.
 + */
@@ -99,14 +104,18 @@ index 0000000..ba59015
 +#include <kern/sched_prim.h>
 +#include <machine/machine_routines.h>
 +#include <pexpert/pexpert.h>
++#include <vm/vm_kern.h>
++#include <vm/pmap.h>
++#include <arm/caches_internal.h>
 +
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
 +extern kern_return_t thread_terminate(thread_t);
 +extern void sweet_hid_touch(int finger, int down, int x, int y);
 +extern kern_return_t kernel_thread_start_priority(thread_continue_t continuation,
 +    void *parameter, integer_t priority, thread_t *new_thread);
 +extern int sweet_fb_display_off;       /* iokit/Kernel/arm/SweetFramebuffer.cpp */
-+void pandora_touch_init(void);
++void myron_touch_init(void);
 +
 +#define PT_GCC_PA     0x00100000u
 +#define PT_SE_PA      0x01a80000u
@@ -173,16 +182,8 @@ index 0000000..ba59015
 +#define SE_IRQ_EN        0xe1cu
 +#define SE_HW_PARAM0     0xe24u
 +#define SE_HW_PARAM1     0xe28u
-+#define M_DONE           (1u << 0)
-+#define M_CANCEL         (1u << 4)
-+#define M_ABORT          (1u << 5)
-+#define M_ERRORS         ((0xfu << 1) | (3u << 24) | (3u << 28))
-+#define M_IRQ_WANT       (M_DONE | 0x7eu | (0xfu << 22) | (0xfu << 26) | (1u << 30))
-+/* geni_se_config_packing(8 bits, 4 per word, MSB first): FIFO bytes stay LSB first. */
-+#define SE_PACK0         0x0007f8feu
-+#define SE_PACK1         0x000ffefeu
-+#define PT_SPI_DIV       4u            /* 19.2 MHz XO / 4 = 4.8 MHz (IC allows 15 MHz) */
-+#define PT_XFER_MAX      2048u
++#define PT_SPI_DIV       2u            /* 19.2 MHz XO / 2 = 9.6 MHz (IC allows 15 MHz) */
++#define PT_XFER_MAX      4096u        /* DMA TX 0x2000-0x2fff, RX 0x3000-0x3fff */
 +
 +/* TouchComm */
 +#define TC_MARKER        0xa5u
@@ -195,12 +196,14 @@ index 0000000..ba59015
 +#define TC_TOUCH         0x11u
 +#define CMD_IDENTIFY     0x02u
 +#define CMD_ENABLE_REPORT 0x05u
++#define CMD_DISABLE_REPORT 0x06u
++#define TC_THP_FRAME     0xc0u        /* Xiaomi THP raw frame, streamed after reset */
 +#define CMD_V2_ACK       0x07u
 +#define CMD_V2_RETRY     0x08u
 +#define CMD_V2_GET_REPORT 0x0au
 +#define CMD_APP_INFO     0x20u
 +#define CMD_GET_TOUCH_CONFIG 0x25u
-+#define PT_MSG_MAX       1024u
++#define PT_MSG_MAX       4000u
 +
 +static struct {
 +	vm_offset_t gcc, se, tlmm;
@@ -211,12 +214,17 @@ index 0000000..ba59015
 +	unsigned max_rd, max_wr;
 +	unsigned max_x, max_y, max_objects;
 +	bool fill;
++	bool thp;                              /* bit 3: fingers from THP frames too */
++	unsigned rows, cols;                   /* THP image: 16 x 35 */
++	unsigned thp_thr, thp_swap, thp_flip, thp_logs;
++	uint64_t last_ic_touch;                /* last 0x11 report with a finger */
 +	uint8_t msg[PT_MSG_MAX];
 +	unsigned msg_len;
 +	uint8_t config[256];
 +	unsigned config_len;
 +	uint32_t active;
-+	int x[PT_MAX], y[PT_MAX];
++	int x[PT_MAX], y[PT_MAX];               /* last delivered, presented display */
++	int px[PT_MAX], py[PT_MAX];             /* the same in panel pixels */
 +	uint32_t codes_seen[8];                /* bitmap of report codes already logged */
 +	unsigned reports, touch_reports;
 +} pt;
@@ -380,7 +388,190 @@ index 0000000..ba59015
 +	    pt_rd(pt.se, SE_SPI_WORD_LEN), pt_rd(pt.se, SE_TX_STATUS), pt_rd(pt.se, SE_RX_STATUS));
 +}
 +
-+/* FIFO mode, SPI mode 0, 8-bit words, MSB first, chip select 0. */
++/*
++ * SE0's firmware has the FIFO interface disabled (GENI_IF_DISABLE_RO bit 0): transfers go
++ * through the wrapper 4 GPI DMA engine (qcom,gpi-dma@1a00000, ee-offset 0x10000), as
++ * fuxi_touch.c does on the Xiaomi 13. GPII 1 (first of the DT's HLOS gpii-mask 0x1e):
++ * TX channel 0, RX channel 1, one event ring. Per-GPII window = ee base (0x1a00000 -
++ * 0x10000) + 0x20000 + 0x4000 * n: channel contexts +0, event context +0x1000, channel
++ * doorbells +0x2000, event doorbell +0x2100, GPII registers +0x3000 (Linux qcom gpi.c).
++ * The GPI (stream 0x536) and QUP (0x523) need apps SMMU stream matches: each goes to the
++ * context bank that UFS's stream 0x60 already uses (stage 1 off, sweet_ufs.c).
++ */
++#define PT_GPII       1u
++#define PT_GPI_PA     (0x01a00000u - 0x10000u + 0x20000u + 0x4000u * PT_GPII)
++#define PT_SMMU_PA    0x15000000u
++#define PT_DMA_SIZE   0x4000u
++#define FT_EV_OFF     0x0000u
++#define FT_RING_OFF(k) (0x1000u + 0x400u * (k))
++#define FT_TXB_OFF    0x2000u          /* up to 0x800 */
++#define FT_RXB_OFF    0x3000u          /* up to 0x1000 */
++#define FT_RING       64u
++#define FT_EVRING     256u
++#define GPI_CH(k)     (0x0000u + 0x80u * (k))
++#define GPI_EV        0x1000u
++#define GPI_CHDB(k)   (0x2000u + 8u * (k))
++#define GPI_EVDB      0x2100u
++#define GPI_GPII      0x3000u
++
++static vm_offset_t pt_gpi, pt_smmu, pt_dma;
++static uint64_t pt_dma_pa;
++static unsigned pt_wp[2], pt_evrp;
++
++static void
++pt_dma_sync(uint32_t off, uint32_t len)
++{
++	flush_dcache64((addr64_t)(pt_dma_pa + off), len, TRUE);
++}
++
++static uint32_t
++pt_gstate(uint32_t ctx)
++{
++	return (pt_rd(pt_gpi, ctx) >> 20) & 0xf;
++}
++
++static bool
++pt_gpi_cmd(uint32_t reg, uint32_t v, uint32_t ctx, uint32_t want)
++{
++	pt_wr(pt_gpi, GPI_GPII + reg, v);
++	for (unsigned i = 0; i < 50000; i++) {
++		uint32_t st = pt_gstate(ctx);
++		if (st == want) {
++			pt_wr(pt_gpi, GPI_GPII + 0xa0, pt_rd(pt_gpi, GPI_GPII + 0x90));
++			pt_wr(pt_gpi, GPI_GPII + 0xa4, pt_rd(pt_gpi, GPI_GPII + 0x94));
++			return true;
++		}
++		if (st == 0xf) {
++			break;
++		}
++		delay(1);
++	}
++	printf("PANDORA TOUCH: GPI cmd %#x -> state %#x (want %u), error log %#x\n",
++	    v, pt_gstate(ctx), want, pt_rd(pt_gpi, GPI_GPII + 0x200));
++	return false;
++}
++
++/* Stream matches for the GPI and the QUP, pointing where UFS's 0x60 points. Idempotent. */
++static int
++pt_smmu_setup(void)
++{
++	static const uint16_t sid[] = {0x536, 0x523};
++	uint32_t nsmr = pt_rd(pt_smmu, 0x20) & 0xff, s2cr = 0;
++	bool found = false;
++	for (unsigned i = 0; i < nsmr; i++) {
++		uint32_t smr = pt_rd(pt_smmu, 0x800 + 4 * i);
++		if ((smr & 0x80000000u) && ((0x60u ^ smr) & ~(smr >> 16) & 0x7fff) == 0) {
++			s2cr = pt_rd(pt_smmu, 0xc00 + 4 * i);
++			found = true;
++			break;
++		}
++	}
++	if (!found || ((s2cr >> 16) & 3) != 0) {
++		printf("PANDORA TOUCH: no UFS stream match to copy (s2cr %#x)\n", s2cr);
++		return ENODEV;
++	}
++	for (unsigned j = 0; j < 2; j++) {
++		unsigned i, freei = ~0u;
++		for (i = 0; i < nsmr; i++) {
++			uint32_t smr = pt_rd(pt_smmu, 0x800 + 4 * i);
++			if (!(smr & 0x80000000u)) {
++				if (freei == ~0u) {
++					freei = i;
++				}
++				continue;
++			}
++			if (((sid[j] ^ smr) & ~(smr >> 16) & 0x7fff) == 0) {
++				break;
++			}
++		}
++		if (i < nsmr) {
++			printf("PANDORA TOUCH: sid %#x already matched by SMR %u (S2CR %#x)\n", sid[j], i,
++			    pt_rd(pt_smmu, 0xc00 + 4 * i));
++			continue;
++		}
++		if (freei == ~0u) {
++			return ENOSPC;
++		}
++		pt_wr(pt_smmu, 0xc00 + 4 * freei, s2cr);
++		pt_wr(pt_smmu, 0x800 + 4 * freei, 0x80000000u | sid[j]);
++		printf("PANDORA TOUCH: SMR %u = sid %#x -> S2CR %#x (as UFS)\n", freei, sid[j],
++		    pt_rd(pt_smmu, 0xc00 + 4 * freei));
++	}
++	return 0;
++}
++
++static int
++pt_gpi_init(void)
++{
++	uint32_t lo = (uint32_t)pt_dma_pa, hi = (uint32_t)(pt_dma_pa >> 32);
++	for (unsigned k = 0; k < 2; k++) {
++		if (pt_gstate(GPI_CH(k)) == 2) {
++			(void)pt_gpi_cmd(0x08, (2u << 24) | k, GPI_CH(k), 3);
++		}
++		if (pt_gstate(GPI_CH(k))) {
++			(void)pt_gpi_cmd(0x08, (9u << 24) | k, GPI_CH(k), 1);
++			pt_wr(pt_gpi, GPI_GPII + 0x08, (10u << 24) | k);
++			delay(1000);
++		}
++	}
++	if (pt_gstate(GPI_EV)) {
++		(void)pt_gpi_cmd(0x10, 9u << 24, GPI_EV, 1);
++		pt_wr(pt_gpi, GPI_GPII + 0x10, 10u << 24);
++		delay(1000);
++	}
++	bzero((void *)pt_dma, PT_DMA_SIZE);
++	pt_dma_sync(0, PT_DMA_SIZE);
++	pt_wr(pt_gpi, GPI_GPII + 0x88, 0x4f);
++	pt_wr(pt_gpi, GPI_GPII + 0xb8, 1);
++	pt_wr(pt_gpi, GPI_GPII + 0x98, 3);
++	pt_wr(pt_gpi, GPI_GPII + 0x9c, 1);
++	pt_wr(pt_gpi, GPI_GPII + 0x108, 1);
++	pt_wr(pt_gpi, GPI_GPII + 0x120, 0xf);
++	pt_wr(pt_gpi, GPI_GPII + 0x188, 0);
++	pt_wr(pt_gpi, GPI_GPII + 0x18c, 0);
++	pt_wr(pt_gpi, GPI_GPII + 0x400, 0);
++	pt_wr(pt_gpi, GPI_GPII + 0x404, 0);
++	pt_wr(pt_gpi, GPI_GPII + 0x180, 1);
++	pt_wr(pt_gpi, GPI_GPII + 0x200, 0);
++	if (!pt_gpi_cmd(0x10, 0, GPI_EV, 1)) {
++		return EIO;
++	}
++	pt_wr(pt_gpi, GPI_EV + 0x00, 0x10010002u);
++	pt_wr(pt_gpi, GPI_EV + 0x04, FT_EVRING * 16);
++	pt_wr(pt_gpi, GPI_EV + 0x08, lo + FT_EV_OFF);
++	pt_wr(pt_gpi, GPI_EV + 0x0c, hi);
++	pt_wr(pt_gpi, GPI_EVDB + 4, hi);
++	for (uint32_t o = 0x20; o <= 0x34; o += 4) {
++		pt_wr(pt_gpi, GPI_EV + o, 0);
++	}
++	pt_evrp = 0;
++	pt_wr(pt_gpi, GPI_EVDB, lo + FT_EV_OFF + FT_EVRING * 16 - 16);
++	for (unsigned k = 0; k < 2; k++) {
++		if (!pt_gpi_cmd(0x08, k, GPI_CH(k), 1)) {
++			return EIO;
++		}
++		pt_wr(pt_gpi, GPI_CH(k) + 0x00, k ? 0x10000002u : 0x1000000au);
++		pt_wr(pt_gpi, GPI_CH(k) + 0x04, FT_RING * 16);
++		pt_wr(pt_gpi, GPI_CH(k) + 0x08, lo + FT_RING_OFF(k));
++		pt_wr(pt_gpi, GPI_CH(k) + 0x0c, hi);
++		pt_wr(pt_gpi, GPI_CHDB(k) + 4, hi);
++		/* SCRATCH_0: pair channel, protocol 1 (SPI), SE 0. */
++		pt_wr(pt_gpi, GPI_CH(k) + 0x60, k ? 0x00000010u : 0x00010010u);
++		pt_wr(pt_gpi, GPI_CH(k) + 0x64, 0);
++		pt_wr(pt_gpi, GPI_CH(k) + 0x68, 0);
++		pt_wr(pt_gpi, GPI_CH(k) + 0x6c, 0);
++		pt_wr(pt_gpi, GPI_CH(k) + 0x5c, 1);
++		pt_wp[k] = 0;
++	}
++	for (unsigned k = 0; k < 2; k++) {
++		if (!pt_gpi_cmd(0x08, (1u << 24) | k, GPI_CH(k), 2)) {
++			return EIO;
++		}
++	}
++	return 0;
++}
++
++/* geni_se_select_mode(GENI_GPI_DMA); the CONFIG0 TRE sets word size, packing and clock. */
 +static int
 +pt_se_init(void)
 +{
@@ -389,77 +580,114 @@ index 0000000..ba59015
 +		printf("PANDORA TOUCH: SE0 firmware %#x is not SPI\n", fw);
 +		return ENODEV;
 +	}
-+	if (pt_rd(pt.se, SE_IF_DISABLE) & 1u) {
-+		printf("PANDORA TOUCH: SE0 FIFO interface disabled (GSI only); needs GPI DMA\n");
-+		return ENOTSUP;
-+	}
 +	if (pt_rd(pt.se, SE_STATUS) & 1u) {
 +		printf("PANDORA TOUCH: SE0 busy (status %#x)\n", pt_rd(pt.se, SE_STATUS));
 +		return EBUSY;
 +	}
-+	unsigned depth = (pt_rd(pt.se, SE_HW_PARAM0) >> 16) & 0x3f;
 +	pt_wr(pt.se, SE_GSI_EVENT_EN, 0);
 +	pt_wr(pt.se, SE_M_IRQ_CLR, 0xffffffffu);
 +	pt_wr(pt.se, SE_S_IRQ_CLR, 0xffffffffu);
 +	pt_wr(pt.se, SE_DMA_TX_CLR, 0xffffffffu);
 +	pt_wr(pt.se, SE_DMA_RX_CLR, 0xffffffffu);
 +	pt_wr(pt.se, SE_CGC_CTRL, pt_rd(pt.se, SE_CGC_CTRL) | 0x7fu);
++	pt_wr(pt.se, 0xe30, pt_rd(pt.se, 0xe30) | 0xfu);
 +	pt_wr(pt.se, SE_OUTPUT_CTRL, 0x7fu);
 +	pt_wr(pt.se, SE_FORCE_DEFAULT, 1);
-+	pt_wr(pt.se, SE_IRQ_EN, pt_rd(pt.se, SE_IRQ_EN) | 0xfu);
-+	pt_wr(pt.se, SE_DMA_MODE, pt_rd(pt.se, SE_DMA_MODE) & ~1u);
-+	pt_wr(pt.se, SE_RX_WM, 0);
-+	pt_wr(pt.se, SE_RX_RFR_WM, depth > 2 ? depth - 2 : 1);
-+	pt_wr(pt.se, SE_M_IRQ_EN, pt_rd(pt.se, SE_M_IRQ_EN) | M_IRQ_WANT);
-+	pt_wr(pt.se, SE_SPI_LOOPBACK, 0);
-+	pt_wr(pt.se, SE_SPI_DEMUX_SEL, 0);
-+	pt_wr(pt.se, SE_SPI_CPHA, 0);
-+	pt_wr(pt.se, SE_SPI_CPOL, 0);
-+	pt_wr(pt.se, SE_SPI_DEMUX_INV, 0);
-+	pt_wr(pt.se, SE_SPI_WORD_LEN, (pt_rd(pt.se, SE_SPI_WORD_LEN) & ~0x3ffu) | (8u - 4u));
-+	pt_wr(pt.se, SE_TX_PACK0, SE_PACK0);
-+	pt_wr(pt.se, SE_TX_PACK1, SE_PACK1);
-+	pt_wr(pt.se, SE_RX_PACK0, SE_PACK0);
-+	pt_wr(pt.se, SE_RX_PACK1, SE_PACK1);
-+	pt_wr(pt.se, SE_BYTE_GRAN, 0);
-+	pt_wr(pt.se, SE_CLK_SEL, pt.level & 7u);
-+	pt_wr(pt.se, SE_M_CLK_CFG, (PT_SPI_DIV << 4) | 1u);
-+	pt_wr(pt.se, SE_TX_WM, 0);
-+	for (unsigned t = 0; t < 10000 && !pt_on(GCC_S0); t++) {
-+		delay(1);
++	pt_wr(pt.se, SE_IRQ_EN, 0);
++	pt_wr(pt.se, SE_M_IRQ_EN, pt_rd(pt.se, SE_M_IRQ_EN) &
++	    ~((1u << 0) | (1u << 26) | (1u << 27) | (1u << 30)));
++	pt_wr(pt.se, 0x644, pt_rd(pt.se, 0x644) & ~1u);
++	pt_wr(pt.se, SE_DMA_MODE, 1);
++	pt_wr(pt.se, SE_GSI_EVENT_EN, pt_rd(pt.se, SE_GSI_EVENT_EN) | 0xfu);
++	pt_step("apps SMMU", PT_SMMU_PA);
++	pt_smmu = ml_io_map(PT_SMMU_PA, 0x1000);
++	pt_gpi = ml_io_map(PT_GPI_PA, 0x4000);
++	if (!pt_smmu || !pt_gpi) {
++		return ENOMEM;
 +	}
-+	if (!pt_on(GCC_S0)) {
-+		pt_clock_dump("SE0 clock off");
-+		return EIO;
++	int err;
++	if ((err = pt_smmu_setup())) {
++		return err;
 +	}
-+	printf("PANDORA TOUCH: SE0 SPI FIFO mode, depth %u, DFS level %u, %u kHz\n", depth,
-+	    pt.level, 19200u / PT_SPI_DIV);
++	if (kmem_alloc_contig(kernel_map, &pt_dma, PT_DMA_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("PANDORA TOUCH: no DMA memory\n");
++		return ENOMEM;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)pt_dma);
++	if (!pn) {
++		return ENOMEM;
++	}
++	pt_dma_pa = ptoa_64(pn);
++	if (pt_dma_pa + PT_DMA_SIZE > (1ULL << 36)) {
++		printf("PANDORA TOUCH: DMA at %#llx is outside the SMMU's 36-bit range\n", pt_dma_pa);
++		return ENOMEM;
++	}
++	pt_step("GPII 1 registers", PT_GPI_PA);
++	printf("PANDORA TOUCH: GPII %u before: ch0 %#x ch1 %#x ev %#x\n", PT_GPII,
++	    pt_rd(pt_gpi, GPI_CH(0)), pt_rd(pt_gpi, GPI_CH(1)), pt_rd(pt_gpi, GPI_EV));
++	if ((err = pt_gpi_init())) {
++		return err;
++	}
++	printf("PANDORA TOUCH: SE0 SPI over GPII %u, DMA page %#llx, DFS level %u, %u kHz\n",
++	    PT_GPII, pt_dma_pa, pt.level, 19200u / PT_SPI_DIV);
 +	return 0;
 +}
 +
-+/* Cancel, then abort, a command this driver started. */
 +static void
-+pt_se_stop(void)
++pt_tre(unsigned k, uint32_t d0, uint32_t d1, uint32_t d2, uint32_t d3)
 +{
-+	pt_wr(pt.se, SE_M_CMD_CTRL, 1u << 2);
-+	for (unsigned i = 0; i < 2000 && !(pt_rd(pt.se, SE_M_IRQ) & M_CANCEL); i++) {
++	uint32_t off = FT_RING_OFF(k) + 16 * pt_wp[k];
++	volatile uint32_t *t = (volatile uint32_t *)(pt_dma + off);
++	t[0] = d0;
++	t[1] = d1;
++	t[2] = d2;
++	t[3] = d3;
++	pt_dma_sync(off, 16);
++	pt_wp[k] = (pt_wp[k] + 1) % FT_RING;
++}
++
++static void
++pt_ring_db(unsigned k)
++{
++	__asm__ volatile("dsb sy" ::: "memory");
++	pt_wr(pt_gpi, GPI_CHDB(k), (uint32_t)pt_dma_pa + FT_RING_OFF(k) + 16 * pt_wp[k]);
++}
++
++/* Drain events until end-of-transfer (code 2) has come from every channel in want. */
++static int
++pt_gpi_wait(unsigned want)
++{
++	unsigned seen = 0;
++	for (unsigned us = 0; us < 50000; us++) {
++		uint32_t hw = pt_rd(pt_gpi, GPI_EV + 0x10);
++		bool bad = false;
++		while (hw != (uint32_t)pt_dma_pa + FT_EV_OFF + 16 * pt_evrp) {
++			uint32_t off = FT_EV_OFF + 16 * pt_evrp;
++			pt_dma_sync(off, 16);
++			volatile uint32_t *e = (volatile uint32_t *)(pt_dma + off);
++			uint32_t d2 = e[2], d3 = e[3];
++			pt_evrp = (pt_evrp + 1) % FT_EVRING;
++			unsigned code = d2 >> 24, type = (d3 >> 16) & 0xff, ch = d3 >> 24;
++			if (code == 16 || type == 0xff || ch >= 2) {
++				bad = true;
++				printf("PANDORA TOUCH: GPI event %#x %#x\n", d2, d3);
++			} else if (type == 0x22 && code == 2) {
++				seen |= 1u << ch;
++			}
++		}
++		pt_wr(pt_gpi, GPI_EVDB, (uint32_t)pt_dma_pa + FT_EV_OFF +
++		    16 * ((pt_evrp + FT_EVRING - 1) % FT_EVRING));
++		pt_wr(pt_gpi, GPI_GPII + 0xc0, 1);
++		if (bad) {
++			return EIO;
++		}
++		if ((seen & want) == want) {
++			return 0;
++		}
 +		delay(1);
 +	}
-+	if (pt_rd(pt.se, SE_STATUS) & 1u) {
-+		pt_wr(pt.se, SE_M_CMD_CTRL, 1u << 1);
-+		for (unsigned i = 0; i < 2000 && !(pt_rd(pt.se, SE_M_IRQ) & M_ABORT); i++) {
-+			delay(1);
-+		}
-+	}
-+	for (unsigned i = 0; i < 256 && (pt_rd(pt.se, SE_RX_STATUS) & 0x1ffffffu); i++) {
-+		(void)pt_rd(pt.se, SE_RX_FIFO);
-+	}
-+	pt_wr(pt.se, SE_M_IRQ_CLR, 0xffffffffu);
-+	if (pt_rd(pt.se, SE_STATUS) & 1u) {
-+		pt.dead = true;
-+		printf("PANDORA TOUCH: SE0 stuck after abort (status %#x); stopping\n",
-+		    pt_rd(pt.se, SE_STATUS));
-+	}
++	return ETIMEDOUT;
 +}
 +
 +/* One full-duplex transfer with chip select held for its length. tx NULL sends 0xff
@@ -470,61 +698,41 @@ index 0000000..ba59015
 +	if (pt.dead || n == 0 || n > PT_XFER_MAX) {
 +		return EIO;
 +	}
-+	if (pt_rd(pt.se, SE_STATUS) & 1u) {
-+		pt_se_stop();
-+		if (pt.dead) {
-+			return EIO;
-+		}
++	uint8_t *txb = (uint8_t *)(pt_dma + FT_TXB_OFF), *rxb = (uint8_t *)(pt_dma + FT_RXB_OFF);
++	if (tx) {
++		memcpy(txb, tx, n);
++	} else {
++		memset(txb, 0xff, n);
 +	}
-+	pt_wr(pt.se, SE_M_IRQ_CLR, 0xffffffffu);
-+	pt_wr(pt.se, SE_SPI_TX_LEN, n);
-+	pt_wr(pt.se, SE_SPI_RX_LEN, n);
-+	pt_wr(pt.se, SE_M_CMD0, 3u << 27);          /* SPI_FULL_DUPLEX, no fragmentation */
-+	unsigned sent = 0, got = 0;
-+	uint64_t limit;
-+	clock_interval_to_deadline(50, NSEC_PER_MSEC, &limit);
-+	for (;;) {
-+		bool progress = false;
-+		uint32_t irq = pt_rd(pt.se, SE_M_IRQ);
-+		if (irq & M_ERRORS) {
-+			printf("PANDORA TOUCH: SPI error irq %#x (%u/%u sent, %u got)\n", irq, sent, n, got);
-+			pt_se_stop();
-+			return EIO;
++	pt_dma_sync(FT_TXB_OFF, n);
++	pt_dma_sync(FT_RXB_OFF, n);
++	uint32_t hi = (uint32_t)(pt_dma_pa >> 32);
++	pt_tre(1, (uint32_t)pt_dma_pa + FT_RXB_OFF, hi, n, 0x00100200u);
++	/* CONFIG0: 8-bit words (8 - 4), TX/RX packing, mode 0; clock level and divider. */
++	pt_tre(0, 0x03000004u, 0, (pt.level << 16) | PT_SPI_DIV, 0x00220001u);
++	/* GO: full duplex (3), RX length; chain + link. */
++	pt_tre(0, 3u, 0, n, 0x00200801u);
++	pt_tre(0, (uint32_t)pt_dma_pa + FT_TXB_OFF, hi, n, 0x00100200u);
++	pt_ring_db(1);
++	pt_ring_db(0);
++	int err = pt_gpi_wait(3u);
++	if (err) {
++		static unsigned fails;
++		if (fails++ < 10) {
++			printf("PANDORA TOUCH: SPI over GPI failed %d (n %u), ch0 %#x ch1 %#x err log %#x\n",
++			    err, n, pt_rd(pt_gpi, GPI_CH(0)), pt_rd(pt_gpi, GPI_CH(1)),
++			    pt_rd(pt_gpi, GPI_GPII + 0x200));
 +		}
-+		while (sent < n && (pt_rd(pt.se, SE_TX_STATUS) & 0x0fffffffu) < 8u) {
-+			uint32_t w = 0;
-+			for (unsigned j = 0; j < 4 && sent + j < n; j++) {
-+				w |= (uint32_t)(tx ? tx[sent + j] : 0xffu) << (8 * j);
-+			}
-+			pt_wr(pt.se, SE_TX_FIFO, w);
-+			sent = sent + 4 < n ? sent + 4 : n;
-+			progress = true;
++		if (pt_gpi_init()) {
++			pt.dead = true;
 +		}
-+		uint32_t wc = pt_rd(pt.se, SE_RX_STATUS) & 0x1ffffffu;
-+		while (wc--) {
-+			uint32_t w = pt_rd(pt.se, SE_RX_FIFO);
-+			for (unsigned j = 0; j < 4 && got < n; j++, got++) {
-+				if (rx) {
-+					rx[got] = (uint8_t)(w >> (8 * j));
-+				}
-+			}
-+			progress = true;
-+		}
-+		/* DONE is looked at after the drain so the last word is not lost. */
-+		if ((irq & M_DONE) && got >= n) {
-+			pt_wr(pt.se, SE_M_IRQ_CLR, irq);
-+			return 0;
-+		}
-+		if (mach_absolute_time() > limit) {
-+			printf("PANDORA TOUCH: SPI timeout (%u/%u sent, %u got, irq %#x status %#x)\n",
-+			    sent, n, got, pt_rd(pt.se, SE_M_IRQ), pt_rd(pt.se, SE_STATUS));
-+			pt_se_stop();
-+			return ETIMEDOUT;
-+		}
-+		if (!progress) {
-+			delay(1);
-+		}
++		return err;
 +	}
++	pt_dma_sync(FT_RXB_OFF, n);
++	if (rx) {
++		memcpy(rx, rxb, n);
++	}
++	return 0;
 +}
 +
 +/* ---- RPMh: L4I_E0 on ----------------------------------------------------------- */
@@ -621,7 +829,8 @@ index 0000000..ba59015
 +	unsigned ntcs = (config >> (6u * RH_DRV)) & 0x3fu, ncpt = (config >> 27) & 0x1fu;
 +	printf("PANDORA TOUCH: RSC id=%#x (v%u.%u) solver=%#x config=%#x tcs=%u ncpt=%u\n",
 +	    id, major, minor, pt_rd(rh_drv, 4), config, ntcs, ncpt);
-+	const struct rh_layout *L = major == 3 ? &rh_v3 : (major == 2 ? &rh_v2 : NULL);
++	/* Linux uses the 3.0 layout for every major >= 3 (this RSC reads v4.3). */
++	const struct rh_layout *L = major >= 3 ? &rh_v3 : (major == 2 ? &rh_v2 : NULL);
 +	if (!L || ntcs < RH_ACTIVE_N || ntcs > 16 || ncpt < 3 || ncpt > 16) {
 +		printf("PANDORA TOUCH: RSC layout not known; not voting\n");
 +		return ENODEV;
@@ -696,524 +905,122 @@ index 0000000..ba59015
 +	return 0;
 +}
 +
-+/* ---- TouchComm ----------------------------------------------------------------- */
++/* ---- FocalTech FT3683 ---------------------------------------------------------- */
++/*
++ * Framing from the vendor module (focaltech_touch_3683.ko, disassembled fts_write_reg /
++ * fts_read_reg): a write is [addr][data...], a read sends [addr] and then clocks N bytes.
++ * No command byte in between.
++ */
++/* fts_irq_handler writes 0x01 into the command byte before its report read (0x5a04),
++ * and 0xE1 before the raw-data read. 0x00 answers, but it is not the frame. */
++#define FTS_REG_REPORT    0x01u
++#define FTS_REG_RAW       0xE1u
++#define FTS_REG_CHIP_ID   0xA3u
++#define FTS_REG_FW_VER    0xA6u
++#define FTS_REG_VENDOR    0xA8u
++/* Read from the running phone (fts_driver_info / fts_dump_reg): the IC is an FT3683
++ * (driver reports IC ID 0x3683, firmware 0x33, vendor id 0xe0) and its coordinates run
++ * 0..119999 x 0..260799, i.e. hundredths of a panel pixel. */
++#define FTS_CHIP_ID_3683  0x36u          /* fts_check_cid compares the high byte */
++#define FTS_EXPECT_FW     0x33u
++#define FTS_EXPECT_VENDOR 0xe0u
++#define MT_RAW_MAX_X      120000u
++#define MT_RAW_MAX_Y      260800u
++static unsigned mt_max_x, mt_max_y;      /* 0: use MT_RAW_MAX_* */
++#define FTS_REPORT_MAX    128u
++#define FTS_POINTS_MAX    10u
 +
-+static uint8_t
-+tc_crc6(const uint8_t *p, unsigned bits)
++/* The panel ABL leaves us, and the canvas this board presents to iOS (iPhone X). */
++#define MT_PANEL_W        1200
++#define MT_PANEL_H        2608
++#define MT_CANVAS_W       1125
++#define MT_CANVAS_H       2436
++#define MT_POLL_MS        8
++
++static unsigned mt_raw;                 /* myron_touch_raw=1 dumps report frames */
++static unsigned mt_frames;
++static unsigned mt_reports, mt_errors;
++
++static int
++mt_write(const uint8_t *buf, unsigned n)
 +{
-+	static const uint16_t table[16] = {
-+		0, 268, 536, 788, 1072, 1340, 1576, 1828,
-+		2144, 2412, 2680, 2932, 3152, 3420, 3656, 3908
-+	};
-+	uint16_t r = 0x3f << 2;
-+	for (; bits > 8; bits -= 8) {
-+		r ^= *p++;
-+		r = (uint16_t)((r << 4) ^ table[(r >> 4) & 0xf]);
-+		r = (uint16_t)((r << 4) ^ table[(r >> 4) & 0xf]);
-+	}
-+	if (bits > 0) {
-+		uint16_t x = *p;
-+		while (bits--) {
-+			if (x & 0x80) {
-+				r ^= 0x80;
-+			}
-+			x <<= 1;
-+			r <<= 1;
-+			if (r & 0x100) {
-+				r ^= 0x03 << 2;
-+			}
-+		}
-+	}
-+	return (uint8_t)((r >> 2) & 0x3f);
++	return pt_spi(buf, NULL, n);
 +}
 +
-+/* CRC-16/CCITT, MSB first: Synaptics' table version computes the same. */
-+static uint16_t
-+tc_crc16(const uint8_t *p, unsigned n, uint16_t r)
++static int
++mt_read(uint8_t addr, uint8_t *out, unsigned n)
 +{
-+	while (n--) {
-+		r ^= (uint16_t)(*p++ << 8);
-+		for (int i = 0; i < 8; i++) {
-+			r = (r & 0x8000) ? (uint16_t)((r << 1) ^ 0x1021) : (uint16_t)(r << 1);
-+		}
++	uint8_t cmd = addr;
++	int err = pt_spi(&cmd, NULL, 1);
++
++	if (err) {
++		return err;
 +	}
-+	return r;
++	return pt_spi(NULL, out, n);
 +}
 +
++static int
++mt_write_reg(uint8_t addr, uint8_t value)
++{
++	uint8_t buf[2] = { addr, value };
++
++	return mt_write(buf, 2);
++}
++
++static int
++mt_read_reg(uint8_t addr, uint8_t *out)
++{
++	return mt_read(addr, out, 1);
++}
++
++/* FT3683 wants the reset line low for a few ms and >= 100 ms before it answers. */
 +static void
-+tc_hex(const char *what, const uint8_t *p, unsigned n)
++mt_reset(void)
 +{
-+	printf("PANDORA TOUCH: %s (%u):", what, n);
-+	for (unsigned i = 0; i < n && i < 64; i++) {
-+		printf(" %02x", p[i]);
-+	}
-+	printf("%s\n", n > 64 ? " ..." : "");
++	pt_gpio(PT_RESET, 0, 0, 2, 0);
++	pt_sleep(10);
++	pt_gpio(PT_RESET, 0, 0, 2, 1);
++	pt_sleep(150);
 +}
 +
-+/* v1: one message (header, then a continued read for the payload). */
-+static int
-+tc1_read(uint8_t *code)
-+{
-+	uint8_t h[4];
-+	int err = pt_spi(NULL, h, 4);
-+	if (err) {
-+		return err;
-+	}
-+	if (h[0] != TC_MARKER) {
-+		tc_hex("v1 bad header", h, 4);
-+		return EIO;
-+	}
-+	unsigned len = h[2] | (h[3] << 8);
-+	*code = h[1];
-+	pt.msg_len = 0;
-+	if (len == 0) {
-+		return 0;
-+	}
-+	if (len > PT_MSG_MAX || len + 6 > PT_XFER_MAX) {
-+		printf("PANDORA TOUCH: v1 code %#x length %u too long\n", h[1], len);
-+		return EIO;
-+	}
-+	unsigned n = 2 + len + 1 + (pt.crc ? 2 : 0);
-+	if ((err = pt_spi(NULL, pt_buf, n))) {
-+		return err;
-+	}
-+	if (pt_buf[0] != TC_MARKER || pt_buf[1] != TC_CONTINUED) {
-+		tc_hex("v1 bad continued read", pt_buf, n);
-+		return EIO;
-+	}
-+	memcpy(pt.msg, pt_buf + 2, len);
-+	pt.msg_len = len;
-+	return 0;
-+}
-+
-+static int
-+tc1_write(uint8_t cmd, const uint8_t *pl, unsigned n)
-+{
-+	uint8_t b[64];
-+	if (n + 5 > sizeof(b)) {
-+		return EINVAL;
-+	}
-+	b[0] = cmd;
-+	b[1] = (uint8_t)n;
-+	b[2] = (uint8_t)(n >> 8);
-+	if (n) {
-+		memcpy(b + 3, pl, n);
-+	}
-+	unsigned size = n + 3;
-+	if (pt.crc) {
-+		uint16_t c = tc_crc16(b, size, 0xffff);
-+		b[size++] = (uint8_t)c;
-+		b[size++] = (uint8_t)(c >> 8);
-+	}
-+	return pt_spi(b, NULL, size);
-+}
-+
-+static int
-+tc2_write(uint8_t cmd, const uint8_t *pl, unsigned n, bool resend)
-+{
-+	uint8_t b[64];
-+	if (n + 6 > sizeof(b)) {
-+		return EINVAL;
-+	}
-+	if (resend) {
-+		pt.seq--;
-+	}
-+	b[0] = cmd;
-+	b[1] = (uint8_t)n;
-+	b[2] = (uint8_t)(n >> 8);
-+	b[3] = (uint8_t)((pt.seq++ & 1u) << 6);
-+	b[3] |= tc_crc6(b, 26);
-+	unsigned size = 4;
-+	if (n) {
-+		memcpy(b + 4, pl, n);
-+		size += n;
-+		uint16_t c = tc_crc16(b, size, 0xffff);
-+		b[size++] = (uint8_t)(c >> 8);
-+		b[size++] = (uint8_t)c;
-+	}
-+	return pt_spi(b, NULL, size);
-+}
-+
-+/* v2: the response to the command just written: header, then ACK + read per chunk. */
-+static int
-+tc2_response(uint8_t *code)
-+{
-+	uint8_t h[4];
-+	int err = pt_spi(NULL, h, 4);
-+	if (err) {
-+		return err;
-+	}
-+	if (tc_crc6(h, 32) != 0) {
-+		tc_hex("v2 header CRC bad", h, 4);
-+		return EIO;
-+	}
-+	unsigned len = h[1] | (h[2] << 8), off = 0, retries = 0;
-+	*code = h[0];
-+	pt.msg_len = 0;
-+	if (len > PT_MSG_MAX) {
-+		printf("PANDORA TOUCH: v2 code %#x length %u too long\n", h[0], len);
-+		return EIO;
-+	}
-+	bool retry = false;
-+	while (off < len) {
-+		unsigned room = (pt.max_rd ? pt.max_rd : 256) - 6, chunk = len - off;
-+		chunk = chunk > room ? room : chunk;
-+		if ((err = tc2_write(retry ? CMD_V2_RETRY : CMD_V2_ACK, NULL, 0, false)) ||
-+		    (err = pt_spi(NULL, pt_buf, chunk + 6))) {
-+			return err;
-+		}
-+		if (tc_crc6(pt_buf, 32) != 0 || tc_crc16(pt_buf, chunk + 6, 0xffff) != 0) {
-+			if (++retries > 5) {
-+				tc_hex("v2 continued read CRC bad", pt_buf, chunk + 6);
-+				return EIO;
-+			}
-+			retry = true;
-+			continue;
-+		}
-+		retry = false;
-+		retries = 0;
-+		memcpy(pt.msg + off, pt_buf + 4, chunk);
-+		off += chunk;
-+	}
-+	pt.msg_len = len;
-+	return 0;
-+}
-+
-+static int
-+tc2_exchange(uint8_t cmd, const uint8_t *pl, unsigned n, uint8_t *code)
-+{
-+	int err;
-+	for (unsigned tries = 0; tries < 5; tries++) {
-+		if ((err = tc2_write(cmd, pl, n, tries > 0))) {
-+			return err;
-+		}
-+		delay(200);
-+		err = tc2_response(code);
-+		if (err == 0 && *code != 0x08 && *code != 0xfe) {   /* retry requested, corrupted */
-+			return 0;
-+		}
-+		delay(1000);
-+	}
-+	return err ? err : EIO;
-+}
-+
-+/* Next message from the IC: v1 reads one, v2 asks for one (GET_REPORT). */
-+static int
-+tc_read(uint8_t *code)
-+{
-+	return pt.version == 1 ? tc1_read(code) : tc2_exchange(CMD_V2_GET_REPORT, NULL, 0, code);
-+}
-+
-+static void tc_touch_report(const uint8_t *r, unsigned n);
-+
++/*
++ * Fingers in panel pixels (1200 x 2608) -> SweetHIDTouch, which takes the presented
++ * 1125 x 2436 display's pixels (stretched with sweetfb_fill=1, else centred). Same
++ * contract as pandora's pt_deliver, with myron's geometry.
++ */
 +static void
-+tc_report(uint8_t code)
++mt_deliver(uint32_t mask, const int *px, const int *py)
 +{
-+	pt.reports++;
-+	if (code == TC_TOUCH) {
-+		pt.touch_reports++;
-+		tc_touch_report(pt.msg, pt.msg_len);
-+		return;
-+	}
-+	if (!(pt.codes_seen[code >> 5] & (1u << (code & 31)))) {
-+		pt.codes_seen[code >> 5] |= 1u << (code & 31);
-+		printf("PANDORA TOUCH: first report %#x\n", code);
-+		tc_hex("report", pt.msg, pt.msg_len);
-+	}
-+}
-+
-+/* Write a command and wait (ATTN or 10 ms polls, 3 s) for its response; reports that
-+ * arrive meanwhile are handled. The response payload is left in pt.msg. */
-+static int
-+tc_command(uint8_t cmd, const uint8_t *pl, unsigned n, uint8_t *resp)
-+{
-+	uint8_t code = 0;
-+	int err;
-+	if (pt.version == 1) {
-+		err = tc1_write(cmd, pl, n);
-+	} else {
-+		err = tc2_exchange(cmd, pl, n, &code);
-+		if (!err && code != TC_ACK && code < TC_IDENTIFY) {
-+			*resp = code;
-+			return code == TC_OK ? 0 : EIO;
-+		}
-+		if (!err && code == TC_IDENTIFY && cmd == CMD_IDENTIFY) {
-+			*resp = code;
-+			return 0;
-+		}
-+		if (!err && code >= TC_IDENTIFY) {
-+			tc_report(code);
-+		}
-+	}
-+	if (err) {
-+		return err;
-+	}
-+	for (unsigned t = 0; t < 300; t++) {
-+		pt_sleep(10);
-+		if ((err = tc_read(&code))) {
-+			continue;
-+		}
-+		if (code == 0 || code == TC_NO_REPORT || code == TC_ACK) {
-+			continue;
-+		}
-+		if (code >= TC_IDENTIFY) {
-+			if (code == TC_IDENTIFY && cmd == CMD_IDENTIFY) {
-+				*resp = code;
-+				return 0;
-+			}
-+			tc_report(code);
-+			continue;
-+		}
-+		*resp = code;
-+		return code == TC_OK ? 0 : EIO;
-+	}
-+	printf("PANDORA TOUCH: command %#x: no response\n", cmd);
-+	return ETIMEDOUT;
-+}
-+
-+static unsigned
-+le16(const uint8_t *p)
-+{
-+	return p[0] | (p[1] << 8);
-+}
-+
-+static int
-+tc_identify_parse(void)
-+{
-+	if (pt.msg_len < 24) {
-+		tc_hex("identify too short", pt.msg, pt.msg_len);
-+		return EIO;
-+	}
-+	char part[17];
-+	memcpy(part, pt.msg + 2, 16);
-+	part[16] = 0;
-+	for (unsigned i = 0; i < 16; i++) {
-+		if (part[i] && (part[i] < 0x20 || part[i] > 0x7e)) {
-+			part[i] = '?';
-+		}
-+	}
-+	pt.max_wr = le16(pt.msg + 22);
-+	pt.max_rd = pt.msg_len >= 26 ? le16(pt.msg + 24) : 0;
-+	if (pt.max_rd && pt.max_rd < 16) {
-+		pt.max_rd = 0;
-+	}
-+	if (pt.max_rd > PT_XFER_MAX) {
-+		pt.max_rd = PT_XFER_MAX;
-+	}
-+	printf("PANDORA TOUCH: identify: TouchComm v%u version %u mode %#x part \"%s\" build %u "
-+	    "max write %u read %u\n", pt.version, pt.msg[0], pt.msg[1], part,
-+	    pt.msg[18] | (pt.msg[19] << 8) | (pt.msg[20] << 16) | ((uint32_t)pt.msg[21] << 24),
-+	    pt.max_wr, pt.max_rd);
-+	if (pt.msg[1] != 0x01) {
-+		printf("PANDORA TOUCH: not in application firmware (mode %#x); stopping\n", pt.msg[1]);
-+		return ENODEV;
-+	}
-+	return 0;
-+}
-+
-+/* After reset: find the protocol from the first header and get the identify info. */
-+static int
-+tc_detect(void)
-+{
-+	uint8_t h[4], code = 0;
-+	int err = pt_spi(NULL, h, 4);
-+	if (err) {
-+		return err;
-+	}
-+	tc_hex("first header after reset", h, 4);
-+	if (h[0] == TC_MARKER) {
-+		pt.version = 1;
-+		pt.crc = true;              /* found out from the identify packet's tail */
-+		if (h[1] == TC_IDENTIFY) {
-+			unsigned len = le16(h + 2);
-+			unsigned n = 2 + len + 3;
-+			if (len < 24 || len > 64) {
-+				tc_hex("identify header", h, 4);
-+				return EIO;
-+			}
-+			if ((err = pt_spi(NULL, pt_buf, n))) {
-+				return err;
-+			}
-+			tc_hex("identify continued read", pt_buf, n);
-+			if (pt_buf[0] != TC_MARKER || pt_buf[1] != TC_CONTINUED) {
-+				return EIO;
-+			}
-+			memcpy(pt.msg, pt_buf + 2, len);
-+			pt.msg_len = len;
-+			pt.crc = !(pt_buf[2 + len + 1] == TC_PAD && pt_buf[2 + len + 2] == TC_PAD);
-+		} else {
-+			pt.crc = false;
-+			if ((err = tc_command(CMD_IDENTIFY, NULL, 0, &code))) {
-+				return err;
-+			}
-+		}
-+		printf("PANDORA TOUCH: TouchComm v1, CRC %s\n", pt.crc ? "on" : "off");
-+	} else if (tc_crc6(h, 32) == 0 && !(h[0] == 0 && h[1] == 0 && h[2] == 0)) {
-+		pt.version = 2;
-+		if ((err = tc_command(CMD_IDENTIFY, NULL, 0, &code))) {
-+			return err;
-+		}
-+		printf("PANDORA TOUCH: TouchComm v2 (identify answered %#x)\n", code);
-+	} else {
-+		printf("PANDORA TOUCH: no TouchComm header (IC unpowered or SPI wrong)\n");
-+		return ENODEV;
-+	}
-+	return tc_identify_parse();
-+}
-+
-+static int
-+tc_setup(void)
-+{
-+	uint8_t code = 0;
-+	int err;
-+	if ((err = tc_command(CMD_APP_INFO, NULL, 0, &code))) {
-+		printf("PANDORA TOUCH: application info failed %d (code %#x)\n", err, code);
-+		return err;
-+	}
-+	if (pt.msg_len < 38) {
-+		tc_hex("application info too short", pt.msg, pt.msg_len);
-+		return EIO;
-+	}
-+	pt.max_x = le16(pt.msg + 32);
-+	pt.max_y = le16(pt.msg + 34);
-+	pt.max_objects = le16(pt.msg + 36);
-+	printf("PANDORA TOUCH: app info: version %u status %u max %u x %u objects %u image %u x %u\n",
-+	    le16(pt.msg), le16(pt.msg + 2), pt.max_x, pt.max_y, pt.max_objects,
-+	    pt.msg_len >= 44 ? le16(pt.msg + 40) : 0, pt.msg_len >= 44 ? le16(pt.msg + 42) : 0);
-+	if (pt.max_objects == 0 || pt.max_objects > PT_MAX) {
-+		pt.max_objects = PT_MAX;
-+	}
-+	if (pt.max_x == 0 || pt.max_y == 0) {
-+		return EIO;
-+	}
-+	if ((err = tc_command(CMD_GET_TOUCH_CONFIG, NULL, 0, &code))) {
-+		printf("PANDORA TOUCH: touch report config failed %d (code %#x)\n", err, code);
-+		return err;
-+	}
-+	pt.config_len = pt.msg_len < sizeof(pt.config) ? pt.msg_len : sizeof(pt.config);
-+	memcpy(pt.config, pt.msg, pt.config_len);
-+	tc_hex("touch report config", pt.config, pt.config_len);
-+	return pt.config_len ? 0 : EIO;
-+}
-+
-+/* syna_tcm_get_touch_data: little-endian bit field at a bit offset. */
-+static unsigned
-+tc_bits(const uint8_t *r, unsigned n, unsigned off, unsigned bits)
-+{
-+	if (bits == 0 || bits > 32 || off + bits > n * 8) {
-+		return 0;
-+	}
-+	unsigned out = 0, done = 0;
-+	while (done < bits) {
-+		unsigned bo = off % 8, take = 8 - bo;
-+		take = take < bits - done ? take : bits - done;
-+		out |= ((unsigned)(r[off / 8] >> bo) & (0xffu >> (8 - take))) << done;
-+		off += take;
-+		done += take;
-+	}
-+	return out;
-+}
-+
-+/* Touch report, decoded with the IC's own report config (syna_tcm_parse_touch_report). */
-+static void
-+tc_touch_report(const uint8_t *r, unsigned n)
-+{
-+	unsigned status[PT_MAX] = {0}, xs[PT_MAX] = {0}, ys[PT_MAX] = {0};
-+	unsigned idx = 0, off = 0, obj = 0, next = 0, objects = 0, active_objects = 0;
-+	bool active_only = false, have_count = false;
-+	static unsigned end_of_foreach;
-+	while (idx < pt.config_len) {
-+		uint8_t c = pt.config[idx++];
-+		unsigned bits, v;
-+		switch (c) {
-+		case 0x00:
-+			goto done;
-+		case 0x01:          /* for each active object */
-+			obj = 0;
-+			next = idx;
-+			active_only = true;
-+			break;
-+		case 0x02:          /* for each object */
-+			obj = 0;
-+			next = idx;
-+			active_only = false;
-+			break;
-+		case 0x03:          /* end for each */
-+			end_of_foreach = idx;
-+			if (active_only) {
-+				if (have_count) {
-+					objects++;
-+					obj++;
-+					if (objects < active_objects) {
-+						idx = next;
-+					}
-+				} else if (off < n * 8) {
-+					obj++;
-+					idx = next;
-+				}
-+			} else {
-+				obj++;
-+				if (obj < pt.max_objects) {
-+					idx = next;
-+				}
-+			}
-+			break;
-+		case 0x04:          /* pad to next byte */
-+			off = (off + 7) / 8 * 8;
-+			break;
-+		default:
-+			if (idx >= pt.config_len) {
-+				goto done;
-+			}
-+			bits = pt.config[idx++];
-+			v = tc_bits(r, n, off, bits);
-+			off += bits;
-+			if (c == 0x06) {
-+				obj = v;
-+			} else if (obj < PT_MAX && c == 0x07) {
-+				status[obj] = v;
-+			} else if (obj < PT_MAX && c == 0x08) {
-+				xs[obj] = v;
-+			} else if (obj < PT_MAX && c == 0x09) {
-+				ys[obj] = v;
-+			} else if (c == 0x18) {
-+				active_objects = v;
-+				have_count = true;
-+				if (v == 0) {
-+					if (end_of_foreach == 0) {
-+						goto done;
-+					}
-+					idx = end_of_foreach;
-+				}
-+			}
-+			break;
-+		}
-+		if (obj > 64) {
-+			break;
-+		}
-+	}
-+done:
 +	if (sweet_fb_display_off) {
-+		return;
++		mask = 0;
 +	}
-+	uint32_t mask = 0;
 +	for (unsigned id = 0; id < PT_MAX; id++) {
-+		/* finger, glove, stylus, eraser, small object */
-+		if (status[id] < 1 || status[id] > 5) {
++		if (!(mask & (1u << id))) {
 +			continue;
 +		}
-+		mask |= 1u << id;
-+		/* IC units -> the presented 1125x2436 display (SweetHID.cpp on PANDORA). */
-+		uint64_t px = (uint64_t)xs[id] * 1220 / (pt.max_x + 1);
-+		uint64_t py = (uint64_t)ys[id] * 2656 / (pt.max_y + 1);
 +		int x, y;
++
 +		if (pt.fill) {
-+			x = (int)((uint64_t)xs[id] * 1125 / (pt.max_x + 1));
-+			y = (int)((uint64_t)ys[id] * 2436 / (pt.max_y + 1));
++			x = px[id] * MT_CANVAS_W / MT_PANEL_W;
++			y = py[id] * MT_CANVAS_H / MT_PANEL_H;
 +		} else {
-+			x = (int)px - (1220 - 1125) / 2;
-+			y = (int)py - (2656 - 2436) / 2;
++			x = px[id] - (MT_PANEL_W - MT_CANVAS_W) / 2;
++			y = py[id] - (MT_PANEL_H - MT_CANVAS_H) / 2;
 +		}
++		if (x < 0) {
++			x = 0;
++		}
++		if (y < 0) {
++			y = 0;
++		}
++		if (x > MT_CANVAS_W - 1) {
++			x = MT_CANVAS_W - 1;
++		}
++		if (y > MT_CANVAS_H - 1) {
++			y = MT_CANVAS_H - 1;
++		}
++		pt.px[id] = px[id];
++		pt.py[id] = py[id];
 +		pt.x[id] = x;
 +		pt.y[id] = y;
 +		sweet_hid_touch((int)id, 1, x, y);
@@ -1223,44 +1030,208 @@ index 0000000..ba59015
 +			sweet_hid_touch((int)id, 0, pt.x[id], pt.y[id]);
 +		}
 +	}
-+	if (mask != pt.active && pt.touch_reports <= 20) {
-+		printf("PANDORA TOUCH: report %u: fingers %#x (first %u,%u raw)\n", pt.touch_reports,
-+		    mask, xs[0], ys[0]);
-+	}
 +	pt.active = mask;
 +}
 +
-+/* ---- thread -------------------------------------------------------------------- */
++/*
++ * Hex dump without snprintf: the kernel has one, but this file also runs on the
++ * pre-console path where only printf is safe to assume.
++ */
++static void
++mt_dump(const char *tag, const uint8_t *p, unsigned n)
++{
++	char line[256];
++	static const char hex[] = "0123456789abcdef";
++	unsigned at = 0;
++	const char *s;
++
++	for (s = tag; *s && at < 200; s++) {
++		line[at++] = *s;
++	}
++	line[at++] = ':';
++	for (unsigned i = 0; i < n && at + 4 < sizeof(line); i++) {
++		line[at++] = ' ';
++		line[at++] = hex[p[i] >> 4];
++		line[at++] = hex[p[i] & 0xf];
++	}
++	line[at] = '\0';
++	printf("MYRON TOUCH %s\n", line);
++}
++
++/* If the id registers answer 0x00/0xff, dump the plausible ranges once. */
++static void
++mt_scan(void)
++{
++	for (unsigned r = 0x00; r <= 0x0f; r++) {
++		uint8_t v = 0;
++
++		if (mt_read_reg((uint8_t)r, &v) == 0) {
++			printf("MYRON TOUCH: scan %02x = %02x\n", r, v);
++		}
++	}
++	for (unsigned r = 0xa0; r <= 0xa8; r++) {
++		uint8_t v = 0;
++
++		if (mt_read_reg((uint8_t)r, &v) == 0) {
++			printf("MYRON TOUCH: scan %02x = %02x\n", r, v);
++		}
++	}
++}
++/*
++ * Report frame: the first byte at 0x00 carries the point count in its high nibble, then
++ * count * 6 bytes of {id, x-hi, x-lo, y-hi, y-lo, weight} with the coordinates packed as
++ * 12 bits (high nibble of the hi byte is the id on some parts, hence the masking).
++ */
++/*
++ * Two record layouts appear in the vendor driver (its 8-byte and 6-byte parse loops);
++ * which one a given firmware uses is not documented, so try both and keep whichever
++ * yields the most plausible points. mt_stride is fixed once a layout wins.
++ */
++static unsigned mt_stride;              /* 0: not chosen yet, else 6 or 8 */
++
++
++static int
++mt_scale(unsigned raw, unsigned panel, unsigned override)
++{
++	if (override) {
++		return (int)((uint64_t)raw * panel / override);
++	}
++	/* the IC's words are panel pixels (myron_touch.c: 0..1199, 0..2607) */
++	return (int)(raw < panel ? raw : panel - 1);
++}
++
++static unsigned
++mt_points(const uint8_t *buf, unsigned count, unsigned stride, int *px, int *py, uint32_t *mask)
++{
++	unsigned good = 0;
++	unsigned lim_x = mt_max_x ? mt_max_x : MT_PANEL_W;
++	unsigned lim_y = mt_max_y ? mt_max_y : MT_PANEL_H;
++
++	*mask = 0;
++	for (unsigned i = 0; i < count; i++) {
++		const uint8_t *q = buf + 1 + stride * i;
++		unsigned id, raw_x, raw_y;
++
++		if (stride == 6) {
++			id = q[0] >> 4;
++			raw_x = ((unsigned)(q[1] & 0x0fu) << 8) | q[2];
++			raw_y = ((unsigned)(q[3] & 0x0fu) << 8) | q[4];
++		} else {
++			id = q[6] >> 4;
++			raw_x = ((unsigned)q[4] << 4) | (q[5] & 0x0fu);
++			raw_y = ((unsigned)q[7] << 4) | (q[8] & 0x0fu);
++		}
++		/* Outside the accepted range means a misparse, not a touch at the edge. */
++		if (id >= PT_MAX || (raw_x == 0 && raw_y == 0) ||
++		    raw_x >= lim_x || raw_y >= lim_y) {
++			continue;
++		}
++		px[id] = mt_scale(raw_x, MT_PANEL_W, mt_max_x);
++		py[id] = mt_scale(raw_y, MT_PANEL_H, mt_max_y);
++		*mask |= 1u << id;
++		good++;
++	}
++	return good;
++}
++
++static int
++mt_poll(void)
++{
++	uint8_t buf[FTS_REPORT_MAX];
++	unsigned len = 1 + 9 * FTS_POINTS_MAX;
++	int err;
++
++	if (len > sizeof(buf)) {
++		len = sizeof(buf);
++	}
++	memset(buf, 0, sizeof(buf));
++	err = mt_read(FTS_REG_REPORT, buf, len);
++	if (err) {
++		return err;
++	}
++	uint8_t head = buf[0];
++
++	if (mt_raw && mt_frames < 24) {
++		mt_frames++;
++		mt_dump("frame", buf, len);
++	}
++	int px[PT_MAX], py[PT_MAX], bx[PT_MAX], by[PT_MAX];
++	uint32_t best_mask = 0;
++	unsigned best = 0, best_stride = 0, best_count = 0;
++
++	for (unsigned k = 0; k < 2; k++) {
++		unsigned count = k == 0 ? (head & 0x0fu) : ((head >> 4) & 0x0fu);
++
++		if (count == 0) {
++			continue;
++		}
++		if (count > FTS_POINTS_MAX) {
++			count = FTS_POINTS_MAX;
++		}
++		for (unsigned s = 0; s < 2; s++) {
++			unsigned stride = s == 0 ? 6 : 8;
++			uint32_t m;
++			unsigned good = mt_points(buf, count, stride, bx, by, &m);
++
++			if (good > best) {
++				best = good;
++				best_stride = stride;
++				best_count = count;
++				best_mask = m;
++				for (unsigned i = 0; i < PT_MAX; i++) {
++					px[i] = bx[i];
++					py[i] = by[i];
++				}
++			}
++		}
++	}
++	if (best == 0) {
++		mt_deliver(0, NULL, NULL);
++		return 0;
++	}
++	if (mt_stride != best_stride) {
++		mt_stride = best_stride;
++		printf("MYRON TOUCH: parsing %u-byte records, count %u from head %02x (%u points)\n",
++		    best_stride, best_count, head, best);
++	}
++	mt_deliver(best_mask, px, py);
++	return 0;
++}
 +
 +static void
-+pt_thread(void *arg, wait_result_t result)
++mt_thread(void *arg, wait_result_t result)
 +{
-+	unsigned mask = 0, delay_s = 5;
++	unsigned mask = 0xf, delay_s = 3;
++	int err;
++
 +	(void)arg;
 +	(void)result;
-+	(void)PE_parse_boot_argn("pandora_touch", &mask, sizeof(mask));
-+	(void)PE_parse_boot_argn("pandora_touchdelay", &delay_s, sizeof(delay_s));
-+	(void)PE_parse_boot_argn("pandora_steps", &pt.steps_ms, sizeof(pt.steps_ms));
-+	int fill = 0;
-+	(void)PE_parse_boot_argn("sweetfb_fill", &fill, sizeof(fill));
-+	pt.fill = fill != 0;
-+	printf("PANDORA TOUCH: pandora_touch=%#x, starting in %u s\n", mask, delay_s);
++	(void)PE_parse_boot_argn("myron_touch", &mask, sizeof(mask));
++	(void)PE_parse_boot_argn("myron_touchdelay", &delay_s, sizeof(delay_s));
++	(void)PE_parse_boot_argn("myron_touch_raw", &mt_raw, sizeof(mt_raw));
++	{
++		int fill = 0;
++
++		(void)PE_parse_boot_argn("sweetfb_fill", &fill, sizeof(fill));
++		pt.fill = fill != 0;
++	}
++	/* The IC's own coordinate space is not documented; allow a runtime override while
++	 * bringing the panel up (myron_touch_max_x / _max_y, in IC units). */
++	(void)PE_parse_boot_argn("myron_touch_max_x", &mt_max_x, sizeof(mt_max_x));
++	(void)PE_parse_boot_argn("myron_touch_max_y", &mt_max_y, sizeof(mt_max_y));
++	printf("MYRON TOUCH: myron_touch=%#x, raw=%u, starting in %u s\n", mask, mt_raw, delay_s);
 +	pt_sleep(delay_s * 1000u);
 +	pt.gcc = ml_io_map(PT_GCC_PA, 0x1f0000);
 +	pt.tlmm = ml_io_map(PT_TLMM_PA, 0xa0000);
 +	pt.se = ml_io_map(PT_SE_PA, 0x4000);
 +	if (!pt.gcc || !pt.tlmm || !pt.se) {
++		printf("MYRON TOUCH: mapping failed\n");
 +		goto out;
 +	}
 +	pt_step("GCC wrapper 4 clocks", PT_GCC_PA + GCC_VOTE);
 +	pt_clock_dump("before");
-+	pt_step("TLMM GPIO 117 (not shared)", PT_TLMM_PA + PT_GPIO(PT_AVDD));
-+	(void)pt_rd(pt.tlmm, PT_GPIO(PT_AVDD));
-+	pt_step("TLMM GPIO 48 (trusted-touch VM list)", PT_TLMM_PA + PT_GPIO(48));
-+	pt_pins_dump("before");
-+	int err;
 +	if ((err = pt_clocks())) {
-+		printf("PANDORA TOUCH: clocks failed %d\n", err);
++		printf("MYRON TOUCH: clocks failed %d\n", err);
 +		goto out;
 +	}
 +	pt_clock_dump("after");
@@ -1268,17 +1239,17 @@ index 0000000..ba59015
 +	pt_se_dump("before");
 +	if (mask & 2u) {
 +		err = pt_rpmh_vote();
-+		printf("PANDORA TOUCH: L4I_E0 vote -> %d\n", err);
++		printf("MYRON TOUCH: L4I_E0 vote -> %d\n", err);
 +	}
 +	if (!(mask & 4u)) {
 +		goto out;
 +	}
 +	if ((err = pt_se_init())) {
++		printf("MYRON TOUCH: SE init failed %d\n", err);
 +		goto out;
 +	}
 +	pt_se_dump("after");
-+	/* Pins, then power and reset (syna_spi_power_on / hw_reset: 50 ms power delay,
-+	 * reset low 10 ms, 200 ms before the first read). */
++	/* Pins, power, reset. FocalTech wants power up before reset and 150 ms after it. */
 +	pt_gpio(PT_RESET, 0, 0, 2, 0);
 +	pt_gpio(PT_IRQ, 0, 0, 2, -1);
 +	for (unsigned p = 48; p <= 51; p++) {
@@ -1286,81 +1257,85 @@ index 0000000..ba59015
 +	}
 +	pt_gpio(PT_AVDD, 0, 0, 2, 1);
 +	pt_sleep(50);
-+	pt_gpio(PT_RESET, 0, 0, 2, 0);
-+	pt_sleep(10);
-+	pt_gpio(PT_RESET, 0, 0, 2, 1);
-+	pt_sleep(200);
++	mt_reset();
 +	pt_pins_dump("after reset");
-+	if ((err = tc_detect()) || (err = tc_setup())) {
-+		printf("PANDORA TOUCH: TouchComm set-up failed %d\n", err);
-+		goto out;
++	uint8_t chip = 0, fw = 0;
++	err = mt_read_reg(FTS_REG_CHIP_ID, &chip);
++	if (!err) {
++		err = mt_read_reg(FTS_REG_FW_VER, &fw);
 +	}
-+	printf("PANDORA TOUCH: running, polling GPIO %u\n", PT_IRQ);
-+	uint64_t active_abs, idle_abs, next = mach_absolute_time(), last_irq = 0, recent_abs;
-+	nanoseconds_to_absolutetime(4 * NSEC_PER_MSEC, &active_abs);
-+	nanoseconds_to_absolutetime(8 * NSEC_PER_MSEC, &idle_abs);
-+	nanoseconds_to_absolutetime(150 * NSEC_PER_MSEC, &recent_abs);
-+	unsigned errors = 0, polls = 0;
++	printf("MYRON TOUCH: chip id %02x, firmware %02x (err %d)\n", chip, fw, err);
++	if (chip == 0x00 || chip == 0xff) {
++		mt_scan();
++	}
++	/* The protocol layer never ran, so the scaling limits are unset. */
++	if (!pt.max_x) {
++		pt.max_x = (mt_max_x ? mt_max_x : MT_RAW_MAX_X) - 1;
++	}
++	if (!pt.max_y) {
++		pt.max_y = (mt_max_y ? mt_max_y : MT_RAW_MAX_Y) - 1;
++	}
++	if (chip != 0x00 && chip != 0xff && chip != FTS_CHIP_ID_3683) {
++		printf("MYRON TOUCH: chip id %02x is not the FT3683 this board has\n", chip);
++	}
++	uint8_t probe = 0xff;
++	if (!mt_read_reg(FTS_REG_REPORT, &probe)) {
++		printf("MYRON TOUCH: report register %02x\n", probe);
++	}
++	/* Write/read-back proves the address phase is not swallowed. */
++	(void)mt_write_reg(0x8c, 0x01);
++	{
++		uint8_t back = 0;
++		(void)mt_read_reg(0x8c, &back);
++		printf("MYRON TOUCH: 0x8c write 01 read %02x\n", back);
++	}
++	printf("MYRON TOUCH: polling every %u ms\n", MT_POLL_MS);
++	uint64_t period, next = mach_absolute_time();
++
++	nanoseconds_to_absolutetime((uint64_t)MT_POLL_MS * NSEC_PER_MSEC, &period);
 +	for (;;) {
-+		uint64_t now = mach_absolute_time();
-+		if (++polls % 15000u == 0) {
-+			printf("PANDORA TOUCH: %u reports (%u touch), %u errors\n", pt.reports,
-+			    pt.touch_reports, errors);
++		if (mt_poll() == 0) {
++			mt_reports++;
++		} else if ((++mt_errors % 200u) == 1) {
++			printf("MYRON TOUCH: %u read errors\n", mt_errors);
 +		}
-+		for (unsigned k = 0; k < 4 && !(pt_rd(pt.tlmm, PT_GPIO(PT_IRQ) + 4) & 1u); k++) {
-+			uint8_t code = 0;
-+			last_irq = now;
-+			if ((err = tc_read(&code))) {
-+				if ((++errors % 100u) == 1) {
-+					printf("PANDORA TOUCH: read error %d (%u)\n", err, errors);
-+				}
-+				if (pt.active) {
-+					tc_touch_report(NULL, 0);
-+				}
-+				break;
-+			}
-+			if (code >= TC_IDENTIFY) {
-+				tc_report(code);
-+			} else if (code == 0 || code == TC_NO_REPORT) {
-+				break;
-+			}
++		if (mt_reports != 0 && (mt_reports % 5000u) == 0) {
++			printf("MYRON TOUCH: %u reports, %u errors\n", mt_reports, mt_errors);
++			mt_reports++;
 +		}
-+		if (pt.dead) {
-+			break;
-+		}
-+		uint64_t period = (pt.active || now - last_irq < recent_abs) ? active_abs : idle_abs;
 +		next += period;
-+		now = mach_absolute_time();
-+		if (next <= now) {
-+			next = now + period;
++		if (next <= mach_absolute_time()) {
++			next = mach_absolute_time() + period;
 +		}
 +		pt_sleep_until(next);
 +	}
 +out:
-+	printf("PANDORA TOUCH: stopped\n");
++	printf("MYRON TOUCH: stopped\n");
 +	(void)thread_terminate(current_thread());
 +	thread_block(THREAD_CONTINUE_NULL);
 +}
 +
 +void
-+pandora_touch_init(void)
++myron_touch_init(void)
 +{
 +	thread_t thread;
-+	unsigned mask = 0;
++	unsigned mask = 0xf;
++
 +	if (pt.started) {
 +		return;
 +	}
 +	pt.started = true;
-+	(void)PE_parse_boot_argn("pandora_touch", &mask, sizeof(mask));
++	(void)PE_parse_boot_argn("myron_touch", &mask, sizeof(mask));
 +	if (!mask) {
-+		printf("PANDORA TOUCH: off (pandora_touch=0)\n");
++		printf("MYRON TOUCH: off (myron_touch=0)\n");
 +		return;
 +	}
-+	if (kernel_thread_start_priority(pt_thread, NULL, PT_PRIORITY, &thread) == KERN_SUCCESS) {
++	if (kernel_thread_start_priority(mt_thread, NULL, PT_PRIORITY, &thread) == KERN_SUCCESS) {
 +		thread_deallocate(thread);
 +	}
 +}
-+#endif /* PANDORA */
++#endif /* MYRON */
+
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 index 7b8946d..c6aaf00 100644
 --- a/bsd/dev/sweet_ufs.c
@@ -1370,7 +1345,7 @@ index 7b8946d..c6aaf00 100644
  extern void fuxi_touch_init(void);
  extern void fuxi_keys_init(void);
 +#if defined(PANDORA)
-+extern void pandora_touch_init(void);
++extern void myron_touch_init(void);
 +#endif
  extern void fuxi_wlan_init(void);
  extern void sweet_usb_probe(void);
@@ -1380,8 +1355,8 @@ index 7b8946d..c6aaf00 100644
  	/* Touch (bsd/dev/fuxi_touch.c; rails voted by the loader). */
  	fuxi_touch_init();
 +#if defined(PANDORA)
-+	/* Main screen touch, Synaptics TouchComm (bsd/dev/pandora_touch.c). */
-+	pandora_touch_init();
++	/* Main screen touch, FocalTech FT3683 (bsd/dev/myron_touch.c). */
++	myron_touch_init();
 +#endif
  	/* Power / volume keys (bsd/dev/fuxi_keys.c, SPMI arbiter v7). */
  	fuxi_keys_init();
@@ -1405,7 +1380,7 @@ index 27bc49d..b4a4f11 100644
 +	fPanelW = 1080;
 +	fPanelH = 2400;
 +#if defined(PANDORA)
-+	/* bsd/dev/pandora_touch.c already reports in the presented display's pixels. */
++	/* bsd/dev/myron_touch.c already reports in the presented display's pixels. */
 +	fPanelW = fLogicalW;
 +	fPanelH = fLogicalH;
 +	fOffX = fOffY = 0;

@@ -51,7 +51,7 @@ DSP_SHM, DSP_SHM_SIZE = 0xb0000000, 0x100000
 GICD, GICD_SIZE = 0x17000000, 0x10000
 GICR, GICR_SIZE = 0x17080000, 0x200000   # 8 redistributors, stride 0x40000
 FB, FB_SIZE = 0xfc800000, 0x2b00000      # splash_region; ARGB8888, measured by shim/hello
-FB_W, FB_H, FB_STRIDE = 1220, 2656, 1220 * 4
+FB_W, FB_H, FB_STRIDE = 1200, 2608, 1200 * 4
 QEMU_FB, QEMU_FB_SIZE = 0x9c000000, 0x1700000
 QEMU_FB_W, QEMU_FB_H, QEMU_FB_STRIDE = 1080, 2400, 1080 * 4
 PANDORA_ECID = 0x50414e444f524101  # 'PANDORA' + 1, synthetic
@@ -79,8 +79,20 @@ def d22ap_product(path=D22AP_ADT):
     """/product properties of the real D22AP tree, without the syscfg
     placeholders iBoot would fill in (flag bit set) and the node bookkeeping."""
     if not os.path.exists(path):
-        print(f'warning: {path} missing, no /product node', file=sys.stderr)
-        return None
+        # The Apple tree is an Apple artifact and needs LZFSE to unpack; the props below are
+        # what UniXNU's myron generator emits for the same iPhone X identity, so the node is
+        # identical without shipping Cupertino's binary.
+        print(f'note: {path} missing, using the built-in D22AP product node', file=sys.stderr)
+        return [
+            ('product-name', cstr('iPhone X')),
+            ('product-description', cstr('iPhone X')),
+            ('artwork-device-idiom', cstr('phone')),
+            ('artwork-device-subtype', u32(2436)),
+            ('artwork-scale-factor', u32(3)),
+            ('artwork-display-gamut', cstr('P3')),
+            ('compatible-device-fallback', cstr('iPhone10,3')),
+            ('thin-bezel', u32(1)),
+        ]
     root, _ = adt.parse(open(path, 'rb').read())
     for c in root.children:
         if dict((k, v) for k, f, v in c.props).get('name') == b'product\0':

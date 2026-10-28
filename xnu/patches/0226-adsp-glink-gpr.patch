@@ -2,7 +2,7 @@ diff --git a/bsd/conf/files b/bsd/conf/files
 index fc10a91..e01305d 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -113,6 +113,10 @@ bsd/dev/pandora_touch.c			standard
+@@ -113,6 +113,10 @@ bsd/dev/myron_touch.c			standard
  bsd/dev/pandora_amp.c			standard
  bsd/dev/pandora_selftest.c		standard
  bsd/dev/pandora_adsp.c			standard

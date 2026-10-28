@@ -1,0 +1,33 @@
+# Static and offline checks only: no NDK, no phone, no IPSW. Seconds to run.
+name: tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shell syntax
+        run: |
+          set -e
+          for f in $(git ls-files '*.sh'); do
+            bash -n "$f" || { echo "syntax error: $f"; exit 1; }
+          done
+
+      - name: python syntax
+        run: |
+          set -e
+          python3 -m py_compile $(git ls-files '*.py')
+          echo "python ok"
+
+      - name: offline tests
+        run: |
+          set -e
+          python3 tools/test_adt_extents.py
+          python3 tools/test_touch_parse.py
+          python3 tools/test_mkpayload.py

@@ -106,9 +106,9 @@ index 24d842f..1731726 100644
 +#define SC_SLOTS          16u
 +#define SC_PIPES          2u                 /* VIG0, VIG1 */
 +#define SC_FLUSH          ((1u << 0) | (1u << 1) | (1u << 17))
-+#define SC_PANEL_W        1220u
-+#define SC_HALF_W         610u
-+#define SC_PANEL_H        2656u
++#define SC_PANEL_W        1200u
++#define SC_HALF_W         600u
++#define SC_PANEL_H        2608u
 +/* REC block registers (dpu_hw_sspp_v13.c) */
 +#define SC_OP_MODE        0x08u
 +#define SC_SRC_SIZE       0x14u

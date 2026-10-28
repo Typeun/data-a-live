@@ -12,7 +12,11 @@
 + * blocks} (4 KiB units, partition-relative) and "fuxi-root-blocks" is the
 + * root size. ufsroot0 is the file's contents; no I/O leaves its extents.
 + */
-+#define FX_MAX_EXTENTS 512
++/* Measured with tools/pinfile on myron: 64 MiB -> 15 extents, 1 GiB -> 198, i.e.
++ * ~5 MiB per extent on a used /data. A 16 GiB root image therefore needs a few
++ * thousand entries, so 512 is not enough. 16384 covers 16 GiB even at 1 MiB each
++ * and costs 384 KiB of BSS. */
++#define FX_MAX_EXTENTS 16384u
 +static struct { uint64_t file, part, count; } fx_ext[FX_MAX_EXTENTS];
 +static unsigned fx_next;
 +static bool fx_root;                    /* extent table loaded and validated */
@@ -60,9 +64,13 @@
 +	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
 +	    SecureDTGetProperty(chosen, "fuxi-root-extents", (void const **)&ext, &size) != kSuccess ||
 +	    SecureDTGetProperty(chosen, "fuxi-root-blocks", (void const **)&blocks, &bsize) != kSuccess ||
-+	    bsize != sizeof(uint64_t) || size == 0 || size % (3 * sizeof(uint64_t)) ||
-+	    size / (3 * sizeof(uint64_t)) > FX_MAX_EXTENTS) {
++	    bsize != sizeof(uint64_t) || size == 0 || size % (3 * sizeof(uint64_t))) {
 +		printf("FUXI UFS: no valid fuxi-root-extents in /chosen\n");
++		return ENXIO;
++	}
++	if (size / (3 * sizeof(uint64_t)) > FX_MAX_EXTENTS) {
++		printf("FUXI UFS: %u extents, limit %u (raise FX_MAX_EXTENTS or defragment /data)\n",
++		    size / (3 * sizeof(uint64_t)), FX_MAX_EXTENTS);
 +		return ENXIO;
 +	}
 +	unsigned n = size / (3 * sizeof(uint64_t));

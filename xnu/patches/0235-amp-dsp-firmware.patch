@@ -4,7 +4,7 @@ index 5004d8a..96af842 100644
 +++ b/bsd/conf/files
 @@ -111,6 +111,7 @@ bsd/dev/sweet_touch.c			standard
  bsd/dev/fuxi_touch.c			standard
- bsd/dev/pandora_touch.c			standard
+ bsd/dev/myron_touch.c			standard
  bsd/dev/pandora_amp.c			standard
 +bsd/dev/pandora_csfw.c			standard
  bsd/dev/pandora_selftest.c		standard

@@ -4,7 +4,7 @@ index a94993f..e0f7286 100644
 +++ b/bsd/conf/files
 @@ -111,6 +111,7 @@ bsd/dev/sweet_touch.c			standard
  bsd/dev/fuxi_touch.c			standard
- bsd/dev/pandora_touch.c			standard
+ bsd/dev/myron_touch.c			standard
  bsd/dev/pandora_amp.c			standard
 +bsd/dev/pandora_selftest.c		standard
  bsd/dev/fuxi_adreno.c			standard
@@ -140,14 +140,14 @@ index 9ab68f0..f858ea4 100644
 +++ b/bsd/dev/sweet_ufs.c
 @@ -60,6 +60,7 @@ extern void fuxi_keys_init(void);
  #if defined(PANDORA)
- extern void pandora_touch_init(void);
+ extern void myron_touch_init(void);
  extern void pandora_amp_init(void);
 +extern void pandora_selftest_init(void);
  #endif
  extern void fuxi_wlan_init(void);
  extern void sweet_usb_probe(void);
 @@ -1513,6 +1514,8 @@ sweet_ufs_init(void)
- 	pandora_touch_init();
+ 	myron_touch_init();
  	/* Speaker amplifiers, I2C probe only (bsd/dev/pandora_amp.c). */
  	pandora_amp_init();
 +	/* Input self-test, boot-arg pandora_selftest (bsd/dev/pandora_selftest.c). */

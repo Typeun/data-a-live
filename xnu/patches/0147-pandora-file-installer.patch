@@ -2,7 +2,7 @@ diff --git a/bsd/conf/files b/bsd/conf/files
 index c943cf8..e8a84d8 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -113,6 +113,7 @@ bsd/dev/pandora_touch.c			standard
+@@ -113,6 +113,7 @@ bsd/dev/myron_touch.c			standard
  bsd/dev/pandora_amp.c			standard
  bsd/dev/pandora_selftest.c		standard
  bsd/dev/pandora_adsp.c			standard
@@ -241,7 +241,7 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 index e94e8d5..eac90d7 100644
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -63,6 +63,7 @@ extern void pandora_touch_init(void);
+@@ -63,6 +63,7 @@ extern void myron_touch_init(void);
  extern void pandora_amp_init(void);
  extern void pandora_selftest_init(void);
  extern void pandora_adsp_init(void);

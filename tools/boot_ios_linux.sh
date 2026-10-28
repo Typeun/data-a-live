@@ -1,0 +1,164 @@
+#!/bin/bash
+# One command for a myron boot with a root (or test) file pinned in Android's userdata.
+# Linux/VM native: adb, fastboot and python3 all run on this host (no WSL, no Git Bash).
+#
+#   tools/boot_ios_linux.sh --file /data/local/tmp/iosroot.img --run 19 [--cmdline "..."]
+#                     [--cpus 8] [--rd md0|ufsroot0] [--check pattern|hfsx|none]
+#                     [--log /data/local/tmp/ioslog.img] [--fw /data/local/tmp/adspfw.img]
+#                     [--debug 0x8] [--dry-run] [--no-boot] [--self-test]
+#    (--rd ufsroot0: root on the pinned file itself, no RAM disk;
+#     --log: a second pinned file for the kernel console log, patch 0129, needs ufsrw=1;
+#     --fw: a pinned firmware pack (tools/mkfwpack.py) for patch 0144's ADSP loader;
+#     --debug 0x8: panics reset the phone instead of waiting, default 0xc)
+#
+# 1. Phone in Android (adb): each file must be pinned with no GC move failures; its extent
+#    list is saved to device/extents/<name>-<time>.json and must equal the last saved one
+#    (a change means f2fs moved it: stop and look). --check pattern runs pinfile rawcheck
+#    (test file), --check hfsx reads its first block raw and wants the HFSX signature.
+# 2. payload: ADT with those extents (mkadt_pandora.py --root-extents/--log-extents) plus
+#    payload.bin from $RUNDIR<run>, then shim/loader/build.sh -> shim/loader/out/loader-boot.img.
+# 3. adb reboot bootloader, check the product is $DEVICE, fastboot boot (RAM only).
+# Nothing here writes to the phone's storage.
+set -euo pipefail
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+DEVICE=${DEVICE:-myron}
+RUNDIR=${RUNDIR:-$ROOT/run}
+ADB=${ADB:-adb}
+FB=${FB:-fastboot}
+FILE="" RUN="" CMDLINE="" CPUS=8 CHECK=none DRY=0 RD=md0 LOG="" FW="" DEBUG=0xc NOBOOT=0 SELFTEST=0 RDSET=0
+while [ $# -gt 0 ]; do
+	case $1 in
+	--file) FILE=$2; shift 2 ;;
+	--rd) RD=$2; RDSET=1; shift 2 ;;
+	--run) RUN=$2; shift 2 ;;
+	--cmdline) CMDLINE=$2; shift 2 ;;
+	--cpus) CPUS=$2; shift 2 ;;
+	--check) CHECK=$2; shift 2 ;;
+	--log) LOG=$2; shift 2 ;;
+	--fw) FW=$2; shift 2 ;;
+	--debug) DEBUG=$2; shift 2 ;;
+	--dry-run) DRY=1; shift ;;
+	--no-boot) NOBOOT=1; shift ;;
+	--self-test) SELFTEST=1; shift ;;
+	*) sed -n '2,21p' "$0"; exit 2 ;;
+	esac
+done
+[ "$SELFTEST" = 1 ] || { [ -n "$FILE" ] && [ -n "$RUN" ] || { sed -n '2,21p' "$0"; exit 2; }; }
+P=${PINFILE:-/data/local/tmp/pinfile}
+# python3 when it works, else python (Git Bash ships the former as a store stub)
+PY=
+for c in python3 python; do
+	if command -v "$c" >/dev/null 2>&1 && "$c" -c 'import sys' >/dev/null 2>&1; then
+		PY=$c
+		break
+	fi
+done
+[ -n "$PY" ] || { echo "needs python3" >&2; exit 1; }
+su() { "$ADB" shell su -c "'$*'" | tr -d '\r'; }
+
+# pinned_extents FILE -> prints the saved JSON path (or exits)
+pinned_extents() {
+	local f=$1 st name last now
+	st=$(su "$P status $f"); echo "$st" >&2
+	case $st in *": pinned (GC move failures 0)"*) ;; *) echo "refused: $f not pinned or GC tried to move it" >&2; exit 1 ;; esac
+	mkdir -p "$ROOT/device/extents"
+	name=$(basename "$f" .img)
+	last=$(ls -t "$ROOT/device/extents/$name"-*.json 2>/dev/null | head -1 || true)
+	now="$ROOT/device/extents/$name-$(date +%Y%m%d-%H%M%S).json"
+	su "$P extents $f --json" > "$now"
+	if [ -n "$last" ] && ! cmp -s "$last" "$now"; then
+		echo "refused: extents of $f differ from $last (f2fs moved the file?)" >&2; exit 1
+	fi
+	echo "extents: $(basename "$now")${last:+ (same as $(basename "$last"))}" >&2
+	echo "$now"
+}
+
+if [ "$SELFTEST" = 1 ]; then
+	# No phone, no pinned file: build the chain from a Mach-O and cross-check the pieces.
+	R=$RUNDIR${RUN:-self}
+	[ -n "$KERNEL" ] || {
+		echo "--self-test needs KERNEL=<mach-o> (tools/mkmacho_test.py makes one)" >&2
+		exit 2
+	}
+	[ "$RDSET" = 1 ] || RD=ufsroot0   # no ramdisk here unless asked
+	echo "== self-test: payload + loader from $KERNEL (rd=$RD)"
+	rm -rf "$R"
+	SRC="$ROOT" T="${T:-/tmp/myron-tools}" KERNEL="$KERNEL" TRUSTCACHE="${TRUSTCACHE:-}" \
+		ADTFLAGS="${ADTFLAGS:-}" CPUS="$CPUS" RD="$RD" DEBUG="$DEBUG" NAME=out \
+		bash "$ROOT/wsl/make_phone_payload.sh" "$R" "debug=$DEBUG serial=3 cpus=$CPUS rd=$RD" || exit 1
+	bash "$ROOT/shim/loader/build.sh" | tail -1 || exit 1
+	"$PY" "$ROOT/tools/verify_payload.py" \
+		"$R/phone-out/payload.bin" "$R/phone-out/phone.adt" \
+		"$ROOT/shim/loader/out/loader-boot.img" || exit 1
+	exit 0
+fi
+
+echo "== 1. phone (Android)"
+[ "$("$ADB" shell getprop ro.product.device | tr -d '\r')" = "$DEVICE" ] || { echo "no $DEVICE on adb"; exit 1; }
+su "test -x $P" || { echo "pinfile is not on the phone; run tools/pinfile-build.sh --push" >&2; exit 1; }
+now=$(pinned_extents "$FILE")
+case $CHECK in
+pattern) su "$P rawcheck $FILE" | tail -1 | grep -q ", 0 do not" || { echo "refused: test pattern incomplete"; exit 1; } ;;
+hfsx)
+	off=$("$PY" -I -c "import json,sys; print(json.load(open(sys.argv[1]))['extents'][0][1])" "$now")
+	sig=$(su "dd if=/dev/block/by-name/userdata bs=4096 skip=$((off / 4096)) count=1 2>/dev/null | dd bs=1 skip=1024 count=2 2>/dev/null")
+	[ "$sig" = HX ] || { echo "refused: no HFSX signature at the root's first block (got '$sig')"; exit 1; } ;;
+none) ;;
+*) echo "--check pattern|hfsx|none"; exit 2 ;;
+esac
+ADTFLAGS="--root-extents $now"
+if [ -n "$LOG" ]; then
+	lognow=$(pinned_extents "$LOG")
+	ADTFLAGS="$ADTFLAGS --log-extents $lognow"
+fi
+if [ -n "$FW" ]; then
+	fwnow=$(pinned_extents "$FW")
+	ADTFLAGS="$ADTFLAGS --fw-extents $fwnow"
+fi
+# GPUPOOL=MIB (environment): RAM carved off for the GPU buffer pool (mkadt_pandora.py --gpu-pool).
+if [ -n "${GPUPOOL:-}" ]; then
+	ADTFLAGS="$ADTFLAGS --gpu-pool $GPUPOOL"
+fi
+# Wall clock (patch 0214): the PMK8850 RTC only counts and Android keeps wall time as that count plus an
+# offset of its own, in encrypted storage. Measure the offset here; the kernel adds it to the RTC.
+read -r rtc_count android_now <<< "$(su "cat /sys/class/rtc/rtc0/since_epoch; date +%s" | tr '\n' ' ')"
+case "$rtc_count$android_now" in
+*[!0-9]* | "") echo "rtc: no reading ($rtc_count / $android_now), iOS keeps 1970" ;;
+*)
+	CMDLINE="$CMDLINE pandora_rtc_offset=$((android_now - rtc_count))"
+	echo "rtc: counter $rtc_count, Android $android_now, offset $((android_now - rtc_count))" ;;
+esac
+# The slot Android runs from (patch 0229): the kernel reads the ADSP images from that slot's firmware
+# partition (modem_a or modem_b, Android's /vendor/firmware_mnt).
+slot=$("$ADB" shell getprop ro.boot.slot_suffix | tr -d '\r_')
+case "$slot" in
+a | b) CMDLINE="$CMDLINE pandora_slot=$slot"; echo "slot: $slot" ;;
+*) echo "slot: unknown ($slot), the kernel takes the ADSP images from the pack" ;;
+esac
+
+echo "== 2. payload ($RUNDIR$RUN)"
+# KERNEL=<prelinked mach-o> and TRUSTCACHE="IPSW trust cache..." pass through to make_phone_payload.sh.
+SRC="$ROOT" T="${T:-/tmp/myron-tools}" KERNEL="${KERNEL:-}" TRUSTCACHE="${TRUSTCACHE:-}" \
+	ADTFLAGS="$ADTFLAGS" CPUS="$CPUS" RD="$RD" DEBUG="$DEBUG" NAME=out \
+	bash "$ROOT/wsl/make_phone_payload.sh" "$RUNDIR$RUN" "$CMDLINE" 2>&1 | tail -3
+bash "$ROOT/shim/loader/build.sh" | tail -1
+strings_cmd=$(grep -a -o "debug=0x[0-9a-f]* serial=3 cpus=[0-9] [ -~]*" "$ROOT/shim/loader/out/payload.bin" | head -1 || true)
+echo "cmdline: $strings_cmd"
+[ $DRY = 1 ] && { echo "dry run: not booting"; exit 0; }
+[ $NOBOOT = 1 ] && {
+	echo "== prepared: $ROOT/shim/loader/out/loader-boot.img ($(wc -c < "$ROOT/shim/loader/out/loader-boot.img") bytes)"
+	echo "   not rebooting (--no-boot); run again without it to boot"
+	exit 0
+}
+
+echo "== 3. fastboot boot"
+"$ADB" reboot bootloader
+seen=0
+for _ in $(seq 1 30); do sleep 2; "$FB" devices | grep -q fastboot && { seen=1; break; }; done
+# Without fastboot the phone goes on booting by itself: stop here, nothing was booted.
+[ $seen = 1 ] || { echo "no fastboot device after 60 s: not booted"; exit 1; }
+[ "$("$FB" getvar product 2>&1 | sed -n 's/^product: //p' | tr -d '\r')" = "$DEVICE" ] || { echo "fastboot device is not $DEVICE"; exit 1; }
+out=$("$FB" boot "$ROOT/shim/loader/out/loader-boot.img" 2>&1) || { echo "$out"; echo "fastboot boot failed"; exit 1; }
+echo "$out"
+echo "$out" | grep -q "^Booting.*OKAY" || { echo "fastboot boot did not report Booting OKAY"; exit 1; }
+echo "booted $(sha256sum "$ROOT/shim/loader/out/loader-boot.img" | cut -c1-16) at $(date +%H:%M:%S)"

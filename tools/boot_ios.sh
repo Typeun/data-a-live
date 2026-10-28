@@ -22,7 +22,12 @@
 set -euo pipefail
 export MSYS_NO_PATHCONV=1
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-PT=/d/Android/platform-tools
+# Which device this repo targets (ro.product.device and fastboot getvar product).
+DEVICE=${DEVICE:-myron}
+# WSL distribution and the run directory inside it for make_phone_payload.sh.
+WSLDISTRO=${WSLDISTRO:-Ubuntu-24.04}
+RUNDIR=${RUNDIR:-$ROOT/run}
+PT=${PT:-/d/Android/platform-tools}
 ADB="$PT/adb.exe" FB="$PT/fastboot.exe"
 FILE="" RUN="" CMDLINE="" CPUS=8 CHECK=none DRY=0 RD=md0 LOG="" FW="" DEBUG=0xc
 while [ $# -gt 0 ]; do
@@ -63,7 +68,7 @@ pinned_extents() {
 wslpath_of() { echo "/mnt/$(echo "${1:1:1}" | tr A-Z a-z)${1:2}"; }
 
 echo "== 1. phone (Android)"
-[ "$("$ADB" shell getprop ro.product.device | tr -d '\r')" = pandora ] || { echo "no pandora on adb"; exit 1; }
+[ "$("$ADB" shell getprop ro.product.device | tr -d '\r')" = "$DEVICE" ] || { echo "no $DEVICE on adb"; exit 1; }
 now=$(pinned_extents "$FILE")
 case $CHECK in
 pattern) su "$P rawcheck $FILE" | tail -1 | grep -q ", 0 do not" || { echo "refused: test pattern incomplete"; exit 1; } ;;
@@ -104,11 +109,11 @@ a | b) CMDLINE="$CMDLINE pandora_slot=$slot"; echo "slot: $slot" ;;
 *) echo "slot: unknown ($slot), the kernel takes the ADSP images from the pack" ;;
 esac
 
-echo "== 2. payload (WSL, /opt/work/run$RUN)"
+echo "== 2. payload (WSL, $RUNDIR$RUN)"
 # KERNEL=/opt/work/plk/kN-amfi.macho (tools/mkprelink.py) and TRUSTCACHE="IPSW trust cache..."
 # pass through to make_phone_payload.sh.
-wsl -d Ubuntu-24.04 -u root -- bash -c "KERNEL='${KERNEL:-}' TRUSTCACHE='${TRUSTCACHE:-}' ADTFLAGS='$ADTFLAGS' CPUS=$CPUS RD=$RD DEBUG=$DEBUG NAME=out \
-	bash <(tr -d '\r' < /mnt/d/DeepSeekHarness/claude/ios_pandora/wsl/make_phone_payload.sh) /opt/work/run$RUN '$CMDLINE'" 2>&1 |
+wsl -d "$WSLDISTRO" -u root -- bash -c "KERNEL='${KERNEL:-}' TRUSTCACHE='${TRUSTCACHE:-}' ADTFLAGS='$ADTFLAGS' CPUS=$CPUS RD=$RD DEBUG=$DEBUG NAME=out \
+	bash <(tr -d '\r' < $(wslpath_of "$ROOT/wsl/make_phone_payload.sh")) $RUNDIR$RUN '$CMDLINE'" 2>&1 |
 	grep -v NodeJS | tail -3
 bash "$ROOT/shim/loader/build.sh" | tail -1
 strings_cmd=$(grep -a -o "debug=0x[0-9a-f]* serial=3 cpus=[0-9] [ -~]*" "$ROOT/shim/loader/out/payload.bin" | head -1)
@@ -121,7 +126,7 @@ seen=0
 for _ in $(seq 1 30); do sleep 2; "$FB" devices | grep -q fastboot && { seen=1; break; }; done
 # Without fastboot the phone goes on booting by itself (into the boot_b menu): stop here, nothing was booted.
 [ $seen = 1 ] || { echo "no fastboot device after 60 s: not booted"; exit 1; }
-[ "$("$FB" getvar product 2>&1 | sed -n 's/^product: //p' | tr -d '\r')" = pandora ] || { echo "fastboot device is not pandora"; exit 1; }
+[ "$("$FB" getvar product 2>&1 | sed -n 's/^product: //p' | tr -d '\r')" = "$DEVICE" ] || { echo "fastboot device is not $DEVICE"; exit 1; }
 out=$("$FB" boot "$(cygpath -w "$ROOT/shim/loader/out/loader-boot.img")" 2>&1) || { echo "$out"; echo "fastboot boot failed"; exit 1; }
 echo "$out"
 echo "$out" | grep -q "^Booting.*OKAY" || { echo "fastboot boot did not report Booting OKAY"; exit 1; }

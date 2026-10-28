@@ -3,7 +3,7 @@ index e0f7286..c943cf8 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
 @@ -112,6 +112,7 @@ bsd/dev/fuxi_touch.c			standard
- bsd/dev/pandora_touch.c			standard
+ bsd/dev/myron_touch.c			standard
  bsd/dev/pandora_amp.c			standard
  bsd/dev/pandora_selftest.c		standard
 +bsd/dev/pandora_adsp.c			standard
@@ -129,7 +129,7 @@ index f858ea4..36803a4 100644
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
 @@ -61,6 +61,7 @@ extern void fuxi_keys_init(void);
- extern void pandora_touch_init(void);
+ extern void myron_touch_init(void);
  extern void pandora_amp_init(void);
  extern void pandora_selftest_init(void);
 +extern void pandora_adsp_init(void);

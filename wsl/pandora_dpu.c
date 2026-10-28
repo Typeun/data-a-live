@@ -289,7 +289,7 @@ pandora_dpu_probe(uint64_t fb)
  * the first 100 ms turns translation off again (the ABL's state) and leaves the CPU copy.
  *
  * Pipes. Main screen: CTL0 -> INTF1 (DSI0), source split over LM0/LM1: VIG0 fills x 0-609 and VIG1 x 610-1219
- * of the 1220x2656 panel. A frame is shown by giving both pipes the surface: source rectangles, stride and
+ * of the 1200x2608 panel. A frame is shown by giving both pipes the surface: source rectangles, stride and
  * address in their REC0 blocks, and with sweetfb_fill the QSEED3 scaler (bilinear, no LUT, phase step
  * src/dst in 21-bit fixed point, QSEED4 preload 4/2), all as mainline dpu_hw_sspp_v13.c / dpu_plane.c program
  * them, then CTL0 FLUSH (VIG0 bit 0, VIG1 bit 1, CTL bit 17). Command mode with autorefresh latches the
@@ -320,9 +320,9 @@ extern bool pandora_log_sync(void);                          /* bsd/dev/sweet_uf
 #define SC_SLOTS          16u
 #define SC_PIPES          2u                 /* VIG0, VIG1 */
 #define SC_FLUSH          ((1u << 0) | (1u << 1) | (1u << 17))
-#define SC_PANEL_W        1220u
-#define SC_HALF_W         610u
-#define SC_PANEL_H        2656u
+#define SC_PANEL_W        1200u
+#define SC_HALF_W         600u
+#define SC_PANEL_H        2608u
 /* REC block registers (dpu_hw_sspp_v13.c) */
 #define SC_OP_MODE        0x08u
 #define SC_SRC_SIZE       0x14u

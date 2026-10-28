@@ -23,9 +23,9 @@ void fatal(void) __attribute__((noreturn));
 
 #define FB          0xfc800000ull
 #define FB_SIZE     0x2b00000ull
-#define FB_W        1220u
-#define FB_H        2656u
-#define FB_STRIDE   (1220u * 4)
+#define FB_W        1200u
+#define FB_H        2608u
+#define FB_STRIDE   (1200u * 4)
 /* Kernel RAM must stay inside the clean 0x8c0000000 + 13 GiB range (DT_FINDINGS.md). */
 #define RAM_LO      0x8c0000000ull
 #define RAM_HI      0xc00000000ull
@@ -208,6 +208,10 @@ static const char *boot(void)
 			return "no SWEETXNU payload embedded";
 	if (p->version != 1 || (p->adt_off & 7) || (pl & 7) || p->nsegs == 0 || p->nsegs > 64)
 		return "bad payload header";
+	uint64_t blob = pl_end - pl;
+	/* The segment table lives right after the fixed header (SEG_TABLE = 0x2a8). */
+	if (blob < 0x2a8u || p->nsegs > (blob - 0x2a8u) / sizeof(struct payload_seg))
+		return "segment table outside the payload";
 	hexline("PAYLOAD", pl);
 	hexline("PHYS", p->phys_base);
 	hexline("MEMSIZE", p->mem_size);
@@ -218,18 +222,25 @@ static const char *boot(void)
 		return "payload overlaps kernel memory";
 
 	uint64_t pa_of_va_base = p->phys_base - p->virt_base;
+	uint64_t segs_top = 0;
 	/* Check every destination before writing anything. */
 	for (uint32_t i = 0; i < p->nsegs; i++) {
 		const struct payload_seg *s = &p->segs[i];
 		if (!in_ram(s->vmaddr + pa_of_va_base, s->vmsize) || s->file_size > s->vmsize ||
-		    s->file_off + s->file_size > pl_end - pl)
+		    s->file_off > blob || s->file_size > blob - s->file_off)
 			return "unsafe payload segment";
+		if (s->vmaddr + s->vmsize > segs_top)
+			segs_top = s->vmaddr + s->vmsize;
 	}
+	/* kernel_end comes from the payload: if it sat below the segments, the ADT would
+	 * be copied on top of the kernel image. */
+	if (p->kernel_end < segs_top || p->kernel_end > p->virt_base + p->mem_size)
+		return "kernel_end does not follow the segments";
 	uint64_t adt_pa = p->kernel_end + pa_of_va_base;
 	uint64_t ba_pa = (adt_pa + p->adt_size + PAGE_16K - 1) & ~(PAGE_16K - 1);
 	uint64_t top = ba_pa + PAGE_16K;
 	if (!in_ram(adt_pa, top - adt_pa) || top > p->phys_base + p->mem_size ||
-	    p->adt_off + p->adt_size > pl_end - pl)
+	    p->adt_off > blob || p->adt_size > blob - p->adt_off)
 		return "ADT/boot_args outside kernel RAM";
 
 	for (uint32_t i = 0; i < p->nsegs; i++) {
