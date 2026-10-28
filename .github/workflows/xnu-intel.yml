@@ -20,7 +20,7 @@ on:
     branches: [myron]
 
 concurrency:
-  group: xnu-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
