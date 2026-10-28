@@ -15,7 +15,9 @@ on:
       keep_going:
         description: make -k (collect all compile errors in one run)
         default: "true"
-  # no push trigger: every run is started by hand (private-repo macOS minutes are limited)
+  # push on the port branch also builds: CI queue failures need many automatic retries
+  push:
+    branches: [myron]
 
 concurrency:
   group: xnu-${{ github.ref }}
