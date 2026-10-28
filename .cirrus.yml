@@ -1,0 +1,29 @@
+# Fallback builder: Cirrus CI's macOS Sonoma image ships Xcode 15.4, which is what
+# iig must be (Xcode 16's iig emits IORPC.kernelContent, which xnu-8796 lacks).
+# Same build as .github/workflows/xnu.yml, just another pool.
+task:
+  name: xnu-pandora
+  timeout_in: 120m
+  macos_instance:
+    image: ghcr.io/cirruslabs/macos-sonoma-xcode:15.4
+  env:
+    MACHINE_CONFIG: PANDORA
+    KERNEL_CONFIG: DEVELOPMENT
+    MAKEFLAGS: -k
+  fetch_dxb_script: |
+    git init -q dxb
+    git -C dxb fetch -q --depth 1 https://github.com/blacktop/darwin-xnu-build 663906528d1cd5ea8fde7de6f16de73db9511549
+    git -C dxb checkout -q FETCH_HEAD
+    cp xnu/patches/*.patch xnu/patches/*.sh dxb/patches/
+    sed -i '' 's/\[\[ "\${MACHINE_CONFIG:-}" == SWEET \]\]/[[ "${MACHINE_CONFIG:-}" =~ ^(SWEET|FUXI|PANDORA)$ ]]/' dxb/patches/*.sh
+  deps_script: |
+    brew install -q jq cmake ninja gum bash || true
+    printf '#!/bin/sh\nexit 0\n' > /usr/local/bin/xcodes && chmod +x /usr/local/bin/xcodes || \
+      { printf '#!/bin/sh\nexit 0\n' > /opt/homebrew/bin/xcodes && chmod +x /opt/homebrew/bin/xcodes; }
+  build_script: |
+    cd dxb
+    MACHINE_CONFIG=PANDORA KERNEL_CONFIG=DEVELOPMENT MAKEFLAGS=-k /bin/bash build.sh
+  kernel_artifacts:
+    path: "dxb/fakeroot/System/Library/Kernels/kernel.*"
+  sha_script: |
+    cd dxb/fakeroot/System/Library/Kernels && shasum -a 256 kernel.* 2>/dev/null || true
